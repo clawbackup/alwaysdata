@@ -3,6 +3,7 @@ const { prisma } = require('./db');
 const { decrypt } = require('./crypto');
 const { sendModelChangeNotification } = require('./notifier');
 const { performCheckIn, shouldCheckIn, shouldCheckModels } = require('./checkin');
+const { siteFetch } = require('./site-http');
 
 // 辅助函数：获取嵌套对象的值
 function getNestedValue(obj, path) {
@@ -63,7 +64,7 @@ function computeDiff(prevList, nextList) {
 }
 
 // Newapi/Veloera API：获取模型列表
-async function fetchModelsNewapi(baseUrl, apiKey, userId, apiType, fastify) {
+async function fetchModelsNewapi(baseUrl, apiKey, userId, apiType, fastify, site) {
   const url = new URL('api/user/models', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 15000);
@@ -73,7 +74,7 @@ async function fetchModelsNewapi(baseUrl, apiKey, userId, apiType, fastify) {
   
   try {
     console.log(`[NEWAPI-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -141,7 +142,7 @@ async function fetchModelsNewapi(baseUrl, apiKey, userId, apiType, fastify) {
 }
 
 // Newapi/Veloera API：获取用户信息（billing）
-async function fetchUserInfoNewapi(baseUrl, apiKey, userId, apiType, fastify) {
+async function fetchUserInfoNewapi(baseUrl, apiKey, userId, apiType, fastify, site) {
   const url = new URL('api/user/self', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 10000);
@@ -150,7 +151,7 @@ async function fetchUserInfoNewapi(baseUrl, apiKey, userId, apiType, fastify) {
   
   try {
     console.log(`[NEWAPI-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -211,7 +212,7 @@ async function fetchUserInfoNewapi(baseUrl, apiKey, userId, apiType, fastify) {
 }
 
 // DoneHub API：获取模型列表
-async function fetchModelsDonehub(baseUrl, apiKey, fastify) {
+async function fetchModelsDonehub(baseUrl, apiKey, fastify, site) {
   const url = new URL('api/available_model', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 15000);
@@ -219,7 +220,7 @@ async function fetchModelsDonehub(baseUrl, apiKey, fastify) {
   
   try {
     console.log(`[DONEHUB-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -275,14 +276,14 @@ async function fetchModelsDonehub(baseUrl, apiKey, fastify) {
 }
 
 // VOAPI API：获取用户信息（billing）
-async function fetchUserInfoVoapi(baseUrl, jwtToken, fastify) {
+async function fetchUserInfoVoapi(baseUrl, jwtToken, fastify, site) {
   const url = new URL('api/user/info', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 10000);
   
   try {
     console.log(`[VOAPI-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: {
         'Authorization': jwtToken, // VOAPI直接使用JWT token
@@ -327,14 +328,14 @@ async function fetchUserInfoVoapi(baseUrl, jwtToken, fastify) {
 }
 
 // DoneHub API：获取用户信息（billing）
-async function fetchUserInfoDonehub(baseUrl, apiKey, fastify) {
+async function fetchUserInfoDonehub(baseUrl, apiKey, fastify, site) {
   const url = new URL('api/user/self', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 10000);
   
   try {
     console.log(`[DONEHUB-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -383,14 +384,14 @@ async function fetchUserInfoDonehub(baseUrl, apiKey, fastify) {
 }
 
 // 获取billing订阅额度信息
-async function fetchBillingSubscription(baseUrl, apiKey, fastify) {
+async function fetchBillingSubscription(baseUrl, apiKey, fastify, site) {
   const url = new URL('v1/dashboard/billing/subscription', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 10000);
   
   try {
     console.log(`[BILLING-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: { 
         'Authorization': `Bearer ${apiKey}`,
@@ -451,7 +452,7 @@ async function fetchCustomBilling(site, fastify) {
       }
     }
     
-    const res = await fetch(site.billingUrl, {
+    const res = await siteFetch(site, site.billingUrl, {
       method: 'GET',
       headers,
       signal: ac.signal
@@ -511,14 +512,14 @@ async function fetchCustomBilling(site, fastify) {
 }
 
 // 获取billing使用量信息
-async function fetchBillingUsage(baseUrl, apiKey, fastify) {
+async function fetchBillingUsage(baseUrl, apiKey, fastify, site) {
   const url = new URL('v1/dashboard/billing/usage', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 10000);
   
   try {
     console.log(`[BILLING-REQ] GET ${url}`);
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: { 
         'Authorization': `Bearer ${apiKey}`,
@@ -552,7 +553,7 @@ async function fetchBillingUsage(baseUrl, apiKey, fastify) {
   }
 }
 
-async function fetchModels(baseUrl, apiKey, fastify) {
+async function fetchModels(baseUrl, apiKey, fastify, site) {
   // 使用相对路径（不带前导/）以保留 baseUrl 中的路径部分（如 /api）
   const url = new URL('v1/models', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   const ac = new AbortController();
@@ -563,7 +564,7 @@ async function fetchModels(baseUrl, apiKey, fastify) {
     // VERSION: v2.0-simplified (只用2个头，模仿Python)
     fastify?.log?.info({ msg: 'Fetching with v2.0-simplified headers', url: url.toString() });
     
-    const res = await fetch(url, {
+    const res = await siteFetch(site, url, {
       method: 'GET',
       headers: { 
         'Authorization': `Bearer ${apiKey}`,
@@ -738,31 +739,31 @@ async function checkSite(site, fastify, options = {}) {
     }
     if (!site.unlimitedQuota) {
       billingPromises = Promise.allSettled([
-        fetchUserInfoNewapi(site.baseUrl, apiKey, site.userId || '1', site.apiType, fastify)
+        fetchUserInfoNewapi(site.baseUrl, apiKey, site.userId || '1', site.apiType, fastify, site)
       ]);
     }
-    fetchModelsFunc = () => fetchModelsNewapi(site.baseUrl, apiKey, site.userId || '1', site.apiType, fastify);
+    fetchModelsFunc = () => fetchModelsNewapi(site.baseUrl, apiKey, site.userId || '1', site.apiType, fastify, site);
   } else if (site.apiType === 'donehub') {
     // DoneHub：不需要userId
     if (!site.unlimitedQuota) {
       billingPromises = Promise.allSettled([
-        fetchUserInfoDonehub(site.baseUrl, apiKey, fastify)
+        fetchUserInfoDonehub(site.baseUrl, apiKey, fastify, site)
       ]);
     }
-    fetchModelsFunc = () => fetchModelsDonehub(site.baseUrl, apiKey, fastify);
+    fetchModelsFunc = () => fetchModelsDonehub(site.baseUrl, apiKey, fastify, site);
   } else if (site.apiType === 'voapi') {
     // VOAPI：使用JWT token获取用量，apiKey获取模型
     if (!site.unlimitedQuota) {
       const jwtToken = site.billingAuthValue ? decrypt(site.billingAuthValue) : null;
       if (jwtToken) {
         billingPromises = Promise.allSettled([
-          fetchUserInfoVoapi(site.baseUrl, jwtToken, fastify)
+          fetchUserInfoVoapi(site.baseUrl, jwtToken, fastify, site)
         ]);
       } else {
         console.log(`[VOAPI-WARN] No JWT token configured for billing`);
       }
     }
-    fetchModelsFunc = () => fetchModels(site.baseUrl, apiKey, fastify); // 使用标准OpenAI模式获取模型
+    fetchModelsFunc = () => fetchModels(site.baseUrl, apiKey, fastify, site); // 使用标准OpenAI模式获取模型
   } else {
     // Other: 使用原有的OpenAI兼容方式或自定义billing
     if (!site.unlimitedQuota) {
@@ -774,12 +775,12 @@ async function checkSite(site, fastify, options = {}) {
       } else {
         // 使用默认的OpenAI兼容billing
         billingPromises = Promise.allSettled([
-          fetchBillingSubscription(site.baseUrl, apiKey, fastify),
-          fetchBillingUsage(site.baseUrl, apiKey, fastify)
+          fetchBillingSubscription(site.baseUrl, apiKey, fastify, site),
+          fetchBillingUsage(site.baseUrl, apiKey, fastify, site)
         ]);
       }
     }
-    fetchModelsFunc = () => fetchModels(site.baseUrl, apiKey, fastify);
+    fetchModelsFunc = () => fetchModels(site.baseUrl, apiKey, fastify, site);
   }
   
   try {

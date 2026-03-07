@@ -1,9 +1,44 @@
 const path = require('path');
 const { authPlugin } = require('./auth');
 const { prisma } = require('./db');
-const { encrypt } = require('./crypto');
+const { encrypt, decrypt } = require('./crypto');
 const { onSiteUpdated, scheduleGlobalTask } = require('./scheduler');
 const { checkSiteById } = require('./run');
+const { normalizeProxyUrl, parseProxyUrl, siteFetch } = require('./site-http');
+
+function decryptOptional(value, fieldName, fastify) {
+  if (!value) return null;
+
+  try {
+    return decrypt(value);
+  } catch (error) {
+    fastify?.log?.error({ error: error.message }, `Failed to decrypt ${fieldName}`);
+    return null;
+  }
+}
+
+function encryptProxyUrl(proxyUrl) {
+  const normalized = normalizeProxyUrl(proxyUrl);
+  if (!normalized) return null;
+  parseProxyUrl(normalized);
+  return encrypt(normalized);
+}
+
+function getSiteDetailResponse(site, fastify) {
+  const token = decryptOptional(site.apiKeyEnc, 'API key', fastify);
+  const billingAuthValue = decryptOptional(site.billingAuthValue, 'billing auth value', fastify);
+  const proxyUrl = decryptOptional(site.proxyUrlEnc, 'proxy URL', fastify);
+  const { apiKeyEnc, billingAuthValue: _, proxyUrlEnc, ...rest } = site;
+
+  return {
+    ...rest,
+    token,
+    url: site.baseUrl,
+    type: site.apiType,
+    billingAuthValue,
+    proxyUrl
+  };
+}
 
 async function routes(fastify) {
   await fastify.register(authPlugin);
@@ -50,7 +85,7 @@ async function routes(fastify) {
         fastify.log.info({ siteName: site.name }, 'No snapshot found for site');
       }
       
-      const { apiKeyEnc, ...rest } = site;
+      const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...rest } = site;
       return {
         ...rest,
         billingLimit: latestSnapshot?.billingLimit ?? null,
@@ -104,21 +139,21 @@ async function routes(fastify) {
       });
       
       // 不导出加密的敏感信息，导出原始apiKey和billingAuthValue
-      const { decrypt } = require('./crypto');
       const exportData = sites.map(site => {
-        const { apiKeyEnc, billingAuthValue, ...siteData } = site;
+        const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...siteData } = site;
         return {
           ...siteData,
           apiKey: apiKeyEnc ? decrypt(apiKeyEnc) : null,
           billingAuthValue: billingAuthValue ? decrypt(billingAuthValue) : null,
+          proxyUrl: proxyUrlEnc ? decrypt(proxyUrlEnc) : null,
           // 导出分类名称而不是ID
           categoryName: site.category ? site.category.name : null,
           category: undefined // 移除category对象
         };
       });
-      
+
       return {
-        version: '1.0',
+        version: '1.1',
         exportDate: new Date().toISOString(),
         sites: exportData
       };
@@ -137,20 +172,20 @@ async function routes(fastify) {
         include: { category: true }
       });
 
-      const { decrypt } = require('./crypto');
       const exportData = sites.map(site => {
-        const { apiKeyEnc, billingAuthValue, ...siteData } = site;
+        const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...siteData } = site;
         return {
           ...siteData,
           apiKey: apiKeyEnc ? decrypt(apiKeyEnc) : null,
           billingAuthValue: billingAuthValue ? decrypt(billingAuthValue) : null,
+          proxyUrl: proxyUrlEnc ? decrypt(proxyUrlEnc) : null,
           categoryName: site.category ? site.category.name : null,
           category: undefined
         };
       });
 
       return {
-        version: '1.0',
+        version: '1.1',
         exportDate: new Date().toISOString(),
         sites: exportData
       };
@@ -197,6 +232,7 @@ async function routes(fastify) {
             name, baseUrl, apiType = 'other', userId = null,
             scheduleCron = null, timezone = 'UTC', pinned = false, excludeFromBatch = false,
             billingUrl = null, billingAuthType = 'token', billingAuthValue = null,
+            proxyUrl = null,
             billingLimitField = null, billingUsageField = null, unlimitedQuota = false,
             enableCheckIn = false, checkInMode = 'both'
           } = siteData;
@@ -218,13 +254,15 @@ async function routes(fastify) {
           if (billingAuthValue) {
             billingAuthValueEnc = encrypt(billingAuthValue);
           }
-          
+          const proxyUrlEnc = encryptProxyUrl(proxyUrl);
+
           // 创建站点
           const site = await prisma.site.create({
             data: {
               name, baseUrl, apiKeyEnc, apiType, userId, scheduleCron, timezone, pinned, excludeFromBatch,
               categoryId,
               billingUrl, billingAuthType, billingAuthValue: billingAuthValueEnc,
+              proxyUrlEnc,
               billingLimitField, billingUsageField, unlimitedQuota,
               enableCheckIn, checkInMode
             }
@@ -272,6 +310,7 @@ async function routes(fastify) {
           billingUrl: { type: 'string' },
           billingAuthType: { type: 'string', enum: ['token', 'cookie'] },
           billingAuthValue: { type: 'string' },
+          proxyUrl: { type: 'string' },
           billingLimitField: { type: 'string' },
           billingUsageField: { type: 'string' },
           unlimitedQuota: { type: 'boolean' },
@@ -283,36 +322,44 @@ async function routes(fastify) {
         },
       },
     },
-  }, async (request) => {
-    const { 
-      name, baseUrl, apiKey, apiType = 'other', userId = null, 
-      scheduleCron = null, timezone = 'UTC', pinned = false, excludeFromBatch = false,
-      categoryId = null,
-      billingUrl = null, billingAuthType = 'token', billingAuthValue = null, 
-      billingLimitField = null, billingUsageField = null, unlimitedQuota = false,
-      enableCheckIn = false, checkInMode = 'both',
-      extralink = null, remark = null, sortOrder = 0
-    } = request.body;
-    
-    const apiKeyEnc = encrypt(apiKey);
-    let billingAuthValueEnc = null;
-    if (billingAuthValue) {
-      billingAuthValueEnc = encrypt(billingAuthValue);
+  }, async (request, reply) => {
+    try {
+      const {
+        name, baseUrl, apiKey, apiType = 'other', userId = null,
+        scheduleCron = null, timezone = 'UTC', pinned = false, excludeFromBatch = false,
+        categoryId = null,
+        billingUrl = null, billingAuthType = 'token', billingAuthValue = null,
+        proxyUrl = null,
+        billingLimitField = null, billingUsageField = null, unlimitedQuota = false,
+        enableCheckIn = false, checkInMode = 'both',
+        extralink = null, remark = null, sortOrder = 0
+      } = request.body;
+
+      const apiKeyEnc = encrypt(apiKey);
+      let billingAuthValueEnc = null;
+      if (billingAuthValue) {
+        billingAuthValueEnc = encrypt(billingAuthValue);
+      }
+
+      const site = await prisma.site.create({
+        data: {
+          name, baseUrl, apiKeyEnc, apiType, userId, scheduleCron, timezone, pinned, excludeFromBatch,
+          categoryId: categoryId || null,
+          billingUrl, billingAuthType, billingAuthValue: billingAuthValueEnc,
+          proxyUrlEnc: encryptProxyUrl(proxyUrl),
+          billingLimitField, billingUsageField, unlimitedQuota,
+          enableCheckIn, checkInMode,
+          extralink, remark, sortOrder
+        }
+      });
+      onSiteUpdated(site, fastify);
+      const { apiKeyEnc: _, billingAuthValue: __, proxyUrlEnc, ...rest } = site;
+      return rest;
+    } catch (error) {
+      fastify.log.error({ error, body: request.body }, 'Failed to create site');
+      reply.code(error.statusCode || 500);
+      return { error: error.message || '创建站点失败' };
     }
-    
-    const site = await prisma.site.create({ 
-      data: { 
-        name, baseUrl, apiKeyEnc, apiType, userId, scheduleCron, timezone, pinned, excludeFromBatch,
-        categoryId: categoryId || null,
-        billingUrl, billingAuthType, billingAuthValue: billingAuthValueEnc, 
-        billingLimitField, billingUsageField, unlimitedQuota,
-        enableCheckIn, checkInMode,
-        extralink, remark, sortOrder
-      } 
-    });
-    onSiteUpdated(site, fastify);
-    const { apiKeyEnc: _, ...rest } = site;
-    return rest;
   });
 
   fastify.patch('/api/sites/:id', {
@@ -334,6 +381,7 @@ async function routes(fastify) {
           billingUrl: { type: 'string' },
           billingAuthType: { type: 'string', enum: ['token', 'cookie'] },
           billingAuthValue: { type: 'string' },
+          proxyUrl: { type: 'string' },
           billingLimitField: { type: 'string' },
           billingUsageField: { type: 'string' },
           unlimitedQuota: { type: 'boolean' },
@@ -351,7 +399,7 @@ async function routes(fastify) {
     const {
       name, baseUrl, apiKey, apiType, userId, scheduleCron, timezone, pinned, excludeFromBatch,
       categoryId,
-      billingUrl, billingAuthType, billingAuthValue, billingLimitField, billingUsageField, unlimitedQuota,
+      billingUrl, billingAuthType, billingAuthValue, proxyUrl, billingLimitField, billingUsageField, unlimitedQuota,
       enableCheckIn, checkInMode,
       extralink, remark, sortOrder
     } = request.body || {};
@@ -375,6 +423,7 @@ async function routes(fastify) {
       if (billingAuthValue !== undefined) {
         data.billingAuthValue = billingAuthValue ? encrypt(billingAuthValue) : null;
       }
+      if (proxyUrl !== undefined) data.proxyUrlEnc = encryptProxyUrl(proxyUrl);
       if (billingLimitField !== undefined) data.billingLimitField = billingLimitField;
       if (billingUsageField !== undefined) data.billingUsageField = billingUsageField;
       if (checkInMode) data.checkInMode = checkInMode;
@@ -396,11 +445,11 @@ async function routes(fastify) {
         onSiteUpdated(site, fastify);
       }
       
-      const { apiKeyEnc: _, ...rest } = site;
+      const { apiKeyEnc: _, billingAuthValue: __, proxyUrlEnc, ...rest } = site;
       return rest;
     } catch (error) {
       fastify.log.error({ error, id, body: request.body }, 'Failed to update site');
-      reply.code(500);
+      reply.code(error.statusCode || 500);
       return { error: error.message || '更新站点失败' };
     }
   });
@@ -532,7 +581,7 @@ async function routes(fastify) {
         }
       }
       
-      const res = await fetch(url, {
+      const res = await siteFetch(site, url, {
         method: 'GET',
         headers
       });
@@ -556,7 +605,6 @@ async function routes(fastify) {
     }
   }, async (request, reply) => {
     const { id } = request.params;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({
@@ -569,35 +617,7 @@ async function routes(fastify) {
         return { error: '站点不存在' };
       }
       
-      // 解密 API 密钥
-      let token = null;
-      if (site.apiKeyEnc) {
-        try {
-          token = decrypt(site.apiKeyEnc);
-        } catch (e) {
-          fastify.log.error({ error: e.message }, 'Failed to decrypt API key');
-        }
-      }
-      
-      // 解密 billing auth value
-      let billingAuthValue = null;
-      if (site.billingAuthValue) {
-        try {
-          billingAuthValue = decrypt(site.billingAuthValue);
-        } catch (e) {
-          fastify.log.error({ error: e.message }, 'Failed to decrypt billing auth value');
-        }
-      }
-      
-      // 返回站点信息（包含解密后的token）
-      const { apiKeyEnc, ...rest } = site;
-      return {
-        ...rest,
-        token,
-        url: site.baseUrl,
-        type: site.apiType,
-        billingAuthValue
-      };
+      return getSiteDetailResponse(site, fastify);
     } catch (e) {
       fastify.log.error({ error: e.message }, 'Error fetching site');
       reply.code(500);
@@ -638,7 +658,7 @@ async function routes(fastify) {
           'Content-Type': 'application/json'
         };
         
-        const res = await fetch(url, { headers });
+        const res = await siteFetch(site, url, { headers });
         const data = await res.json();
         
         if (!res.ok || data.code !== 0) {
@@ -688,7 +708,7 @@ async function routes(fastify) {
         }
       }
       
-      const res = await fetch(url, { headers });
+      const res = await siteFetch(site, url, { headers });
       const data = await res.json();
       
       if (!res.ok) {
@@ -711,7 +731,6 @@ async function routes(fastify) {
     }
   }, async (request, reply) => {
     const { id } = request.params;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({ where: { id } });
@@ -748,7 +767,7 @@ async function routes(fastify) {
         // 其他类型不需要用户ID请求头
       }
       
-      const res = await fetch(url, { headers });
+      const res = await siteFetch(site, url, { headers });
       const data = await res.json();
       
       if (!res.ok) {
@@ -772,7 +791,6 @@ async function routes(fastify) {
   }, async (request, reply) => {
     const { id } = request.params;
     const tokenData = request.body;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({ where: { id } });
@@ -864,7 +882,7 @@ async function routes(fastify) {
         };
       }
       
-      const res = await fetch(url, {
+      const res = await siteFetch(site, url, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload)
@@ -901,7 +919,6 @@ async function routes(fastify) {
   }, async (request, reply) => {
     const { id } = request.params;
     const tokenData = request.body;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({ where: { id } });
@@ -965,7 +982,7 @@ async function routes(fastify) {
         payload = tokenData;
       }
       
-      const res = await fetch(url, {
+      const res = await siteFetch(site, url, {
         method: 'PUT',
         headers,
         body: JSON.stringify(payload)
@@ -1000,7 +1017,6 @@ async function routes(fastify) {
     }
   }, async (request, reply) => {
     const { id, tokenId } = request.params;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({ where: { id } });
@@ -1048,7 +1064,7 @@ async function routes(fastify) {
         }
       }
       
-      const res = await fetch(url, {
+      const res = await siteFetch(site, url, {
         method: 'DELETE',
         headers
       });
@@ -1084,7 +1100,6 @@ async function routes(fastify) {
   }, async (request, reply) => {
     const { id } = request.params;
     const { key } = request.body;
-    const { decrypt } = require('./crypto');
     
     try {
       const site = await prisma.site.findUnique({ where: { id } });
@@ -1114,7 +1129,7 @@ async function routes(fastify) {
         }
       }
       
-      const res = await fetch(url, {
+      const res = await siteFetch(site, url, {
         method: 'POST',
         headers,
         body: JSON.stringify({ key })

@@ -46,6 +46,23 @@ function authHeaders(includeJson = false) {
   return h;
 }
 
+function validateProxyUrl(_, value) {
+  if (!value || !String(value).trim()) {
+    return Promise.resolve()
+  }
+
+  try {
+    const parsed = new URL(String(value).trim())
+    const supportedProtocols = ['http:', 'https:', 'socks:', 'socks5:']
+    if (!supportedProtocols.includes(parsed.protocol)) {
+      return Promise.reject(new Error('仅支持 http、https、socks 或 socks5 代理'))
+    }
+    return Promise.resolve()
+  } catch (error) {
+    return Promise.reject(new Error('请输入有效的代理 URL'))
+  }
+}
+
 export default function Sites() {
   const [list, setList] = useState([])
   const [loading, setLoading] = useState(false)
@@ -533,6 +550,7 @@ export default function Sites() {
       v.excludeFromBatch = v.excludeFromBatch === true;
       v.unlimitedQuota = v.unlimitedQuota === true;
       v.enableCheckIn = v.enableCheckIn === true;
+      v.proxyUrl = v.proxyUrl?.trim() || null;
       
       const res = await fetch('/api/sites', { method: 'POST', headers: authHeaders(true), body: JSON.stringify(v) })
       if (!res.ok) {
@@ -545,42 +563,56 @@ export default function Sites() {
     }
   }
 
-  const openEditModal = (site) => {
-    setEditMode(true)
-    setEditingSite(site)
-
-    let cnHour = undefined, cnMinute = undefined
-    if (site.scheduleCron && site.timezone === 'Asia/Shanghai') {
-      const parts = String(site.scheduleCron).trim().split(/\s+/)
-      if (parts.length >= 2) {
-        cnMinute = Number(parts[0])
-        cnHour = Number(parts[1])
+  const openEditModal = async (site) => {
+    try {
+      const res = await fetch(`/api/sites/${site.id}`, { headers: authHeaders() })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '获取站点详情失败')
       }
-    }
 
-    form.setFieldsValue({
-      name: site.name,
-      baseUrl: site.baseUrl,
-      apiKey: '',
-      apiType: site.apiType || 'other',
-      userId: site.userId || '',
-      cnHour,
-      cnMinute,
-      pinned: site.pinned !== undefined ? site.pinned : false,
-      excludeFromBatch: site.excludeFromBatch !== undefined ? site.excludeFromBatch : false,
-      categoryId: site.categoryId || null,
-      unlimitedQuota: site.unlimitedQuota !== undefined ? site.unlimitedQuota : false,
-      billingUrl: site.billingUrl || '',
-      billingAuthType: site.billingAuthType || 'token',
-      billingAuthValue: '',
-      billingLimitField: site.billingLimitField || '',
-      billingUsageField: site.billingUsageField || '',
-      enableCheckIn: site.enableCheckIn !== undefined ? site.enableCheckIn : false,
-      checkInMode: site.checkInMode || 'both',
-      extralink: site.extralink || '',
-      remark: site.remark || ''
-    })
-    setOpen(true)
+      const siteDetail = await res.json()
+      const currentSite = { ...site, ...siteDetail }
+
+      setEditMode(true)
+      setEditingSite(currentSite)
+
+      let cnHour = undefined, cnMinute = undefined
+      if (currentSite.scheduleCron && currentSite.timezone === 'Asia/Shanghai') {
+        const parts = String(currentSite.scheduleCron).trim().split(/\s+/)
+        if (parts.length >= 2) {
+          cnMinute = Number(parts[0])
+          cnHour = Number(parts[1])
+        }
+      }
+
+      form.setFieldsValue({
+        name: currentSite.name,
+        baseUrl: currentSite.baseUrl,
+        apiKey: '',
+        apiType: currentSite.apiType || 'other',
+        userId: currentSite.userId || '',
+        cnHour,
+        cnMinute,
+        pinned: currentSite.pinned !== undefined ? currentSite.pinned : false,
+        excludeFromBatch: currentSite.excludeFromBatch !== undefined ? currentSite.excludeFromBatch : false,
+        categoryId: currentSite.categoryId || null,
+        unlimitedQuota: currentSite.unlimitedQuota !== undefined ? currentSite.unlimitedQuota : false,
+        billingUrl: currentSite.billingUrl || '',
+        billingAuthType: currentSite.billingAuthType || 'token',
+        billingAuthValue: '',
+        proxyUrl: currentSite.proxyUrl || '',
+        billingLimitField: currentSite.billingLimitField || '',
+        billingUsageField: currentSite.billingUsageField || '',
+        enableCheckIn: currentSite.enableCheckIn !== undefined ? currentSite.enableCheckIn : false,
+        checkInMode: currentSite.checkInMode || 'both',
+        extralink: currentSite.extralink || '',
+        remark: currentSite.remark || ''
+      })
+      setOpen(true)
+    } catch (e) {
+      message.error(e.message || '获取站点详情失败')
+    }
   }
 
   const onEdit = async () => {
@@ -601,6 +633,7 @@ export default function Sites() {
         billingUrl: v.billingUrl || null,
         billingAuthType: v.billingAuthType || 'token',
         billingAuthValue: v.billingAuthValue || null,
+        proxyUrl: v.proxyUrl?.trim() || null,
         billingLimitField: v.billingLimitField || null,
         billingUsageField: v.billingUsageField || null,
         enableCheckIn: v.enableCheckIn === true,
@@ -2004,6 +2037,18 @@ export default function Sites() {
               <Input
                 prefix={<GlobalOutlined style={{ color: '#bbb' }} />}
                 placeholder="https://api.yourrelay.com"
+                style={{ borderRadius: 8, fontSize: 15 }}
+              />
+            </Form.Item>
+            <Form.Item
+              name="proxyUrl"
+              label={<span style={{ fontSize: 15, fontWeight: 500 }}>站点代理（可选）</span>}
+              rules={[{ validator: validateProxyUrl }]}
+              extra="支持 http(s):// 或 socks5:// 代理；配置后该站点所有后端访问都将走这个代理"
+            >
+              <Input
+                prefix={<GlobalOutlined style={{ color: '#bbb' }} />}
+                placeholder="例如：http://127.0.0.1:7890 或 socks5://user:pass@host:1080"
                 style={{ borderRadius: 8, fontSize: 15 }}
               />
             </Form.Item>
