@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -15,6 +16,8 @@ process.env.ADMIN_EMAIL = 'admin@example.com';
 process.env.ADMIN_PASSWORD = 'admin123456';
 
 const serverRoot = path.resolve(__dirname, '..');
+const CHALLENGE_SEED = 'seed-28';
+const CHALLENGE_PREFIX = '0000';
 let tempDir;
 let buildServer;
 let prisma;
@@ -26,6 +29,21 @@ async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return server.address().port;
+}
+
+function parseCookies(cookieHeader) {
+  const cookies = new Map();
+  if (!cookieHeader) return cookies;
+
+  for (const segment of String(cookieHeader).split(';')) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex <= 0) continue;
+    cookies.set(trimmed.slice(0, separatorIndex), trimmed.slice(separatorIndex + 1));
+  }
+
+  return cookies;
 }
 
 function createUpstreamServer() {
@@ -66,6 +84,113 @@ function createUpstreamServer() {
 
       res.statusCode = 404;
       res.end(JSON.stringify({ error: `Unhandled path: ${url.pathname}` }));
+    });
+  });
+
+  return { server, requests };
+}
+
+function renderBunkerWebChallengeHtml() {
+  return `<!doctype html>
+<html>
+  <head>
+    <title>Bot Detection</title>
+  </head>
+  <body>
+    <h1>Please wait while we check if you are a Human</h1>
+    <p>Protected by BunkerWeb</p>
+    <form method="post" class="hidden" action="/challenge" id="form">
+      <input type="hidden" name="challenge" id="challenge" value="" />
+    </form>
+    <script>
+      async function digestMessage(message) {
+        return message;
+      }
+      async function run() {
+        let a = 0;
+        while (!(await digestMessage("${CHALLENGE_SEED}" + a.toString())).startsWith("${CHALLENGE_PREFIX}")) {
+          a += 1;
+        }
+        document.getElementById("challenge").value = a.toString();
+        document.getElementById("form").submit();
+      }
+      run();
+    </script>
+  </body>
+</html>`;
+}
+
+function createBunkerWebProtectedServer() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const bodyChunks = [];
+
+    req.on('data', (chunk) => bodyChunks.push(chunk));
+    req.on('end', () => {
+      const cookies = parseCookies(req.headers.cookie);
+      const requestBody = Buffer.concat(bodyChunks).toString('utf8');
+
+      requests.push({
+        path: url.pathname,
+        method: req.method,
+        viaProxy: req.headers['x-through-proxy'] === 'yes',
+        cookie: req.headers.cookie || '',
+        body: requestBody
+      });
+
+      if (url.pathname === '/challenge' && req.method === 'GET') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.end(renderBunkerWebChallengeHtml());
+        return;
+      }
+
+      if (url.pathname === '/challenge' && req.method === 'POST') {
+        const params = new URLSearchParams(requestBody);
+        const challengeValue = params.get('challenge') || '';
+        const expectedHash = crypto.createHash('sha256').update(`${CHALLENGE_SEED}${challengeValue}`).digest('hex');
+        const targetPath = decodeURIComponent(cookies.get('bw_target') || '/api/user/models');
+
+        if (!expectedHash.startsWith(CHALLENGE_PREFIX)) {
+          res.statusCode = 403;
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.end('<html><body><h1>Forbidden</h1><p>BunkerWeb</p></body></html>');
+          return;
+        }
+
+        res.statusCode = 302;
+        res.setHeader('Location', targetPath);
+        res.setHeader('Set-Cookie', [
+          'bw_verified=1; Path=/',
+          'bw_target=; Max-Age=0; Path=/'
+        ]);
+        res.end();
+        return;
+      }
+
+      if ((url.pathname === '/api/user/models' || url.pathname === '/api/user/self') && cookies.get('bw_verified') !== '1') {
+        res.statusCode = 302;
+        res.setHeader('Location', '/challenge');
+        res.setHeader('Set-Cookie', `bw_target=${encodeURIComponent(url.pathname)}; Path=/`);
+        res.end();
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/json');
+
+      if (url.pathname === '/api/user/models') {
+        res.end(JSON.stringify({ success: true, data: ['gpt-4o-mini', 'claude-3-5-sonnet'] }));
+        return;
+      }
+
+      if (url.pathname === '/api/user/self') {
+        res.end(JSON.stringify({ success: true, data: { quota: 1250000, used_quota: 250000, status: 1 } }));
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end(JSON.stringify({ success: false, message: `Unhandled path: ${url.pathname}` }));
     });
   });
 
@@ -263,6 +388,42 @@ test('site checks and token proxy routes honor per-site proxy settings', async (
     assert.equal(directCheckResponse.statusCode, 200, directCheckResponse.body);
     assert.equal(proxy.requests.length, proxyRequestCount);
     assert.ok(upstream.requests.some((request) => request.path === '/v1/models' && !request.viaProxy));
+  } finally {
+    await Promise.all([
+      new Promise((resolve) => proxy.server.close(resolve)),
+      new Promise((resolve) => upstream.server.close(resolve))
+    ]);
+  }
+});
+
+test('newapi site check solves BunkerWeb challenge through per-site proxy', async () => {
+  const upstream = createBunkerWebProtectedServer();
+  const proxy = createHttpProxyServer();
+  const upstreamPort = await listen(upstream.server);
+  const proxyPort = await listen(proxy.server);
+
+  try {
+    const protectedSite = await createSite({
+      name: 'protected-newapi-site',
+      baseUrl: `http://127.0.0.1:${upstreamPort}`,
+      apiKey: 'sk-newapi',
+      apiType: 'newapi',
+      userId: '15875',
+      proxyUrl: `http://127.0.0.1:${proxyPort}`
+    });
+
+    const checkResponse = await app.inject({
+      method: 'POST',
+      url: `/api/sites/${protectedSite.id}/check?skipNotification=true`
+    });
+
+    assert.equal(checkResponse.statusCode, 200, checkResponse.body);
+    assert.equal(checkResponse.json().ok, true);
+    assert.ok(proxy.requests.some((request) => request.url.includes('/challenge')));
+    assert.ok(upstream.requests.filter((request) => request.path === '/challenge' && request.viaProxy).length >= 2);
+    assert.ok(upstream.requests.some((request) => request.path === '/api/user/models' && request.viaProxy));
+    assert.ok(upstream.requests.some((request) => request.path === '/api/user/self' && request.viaProxy));
+    assert.ok(upstream.requests.some((request) => request.path === '/challenge' && request.method === 'POST' && /challenge=688/.test(request.body)));
   } finally {
     await Promise.all([
       new Promise((resolve) => proxy.server.close(resolve)),
