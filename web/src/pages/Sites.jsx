@@ -621,7 +621,7 @@ export default function Sites() {
       if (v.cnHour !== undefined && v.cnMinute !== undefined && v.cnHour !== null && v.cnMinute !== null) {
         const h = Math.max(0, Math.min(23, Number(v.cnHour)))
         const m = Math.max(0, Math.min(59, Number(v.cnMinute)))
-        updateData.scheduleCron = `${m} ${h} * *`
+        updateData.scheduleCron = `${m} ${h} * * *`
         updateData.timezone = 'Asia/Shanghai'
       } else {
         updateData.scheduleCron = null
