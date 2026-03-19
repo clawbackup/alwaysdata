@@ -42,9 +42,6 @@ async function buildServer() {
 
   await fastify.register(routes);
 
-  // 初始化认证模块
-  await initAuth(fastify);
-
   if (fs.existsSync(staticRoot)) {
     fastify.setNotFoundHandler((req, reply) => {
       // For SPA, serve index.html for non-API routes
@@ -77,10 +74,18 @@ async function buildServer() {
   return fastify;
 }
 
-buildServer()
-  .then((app) => app.listen({ port: CONFIG.PORT, host: '0.0.0.0' }))
-  .catch((err) => {
+async function startServer() {
+  const app = await buildServer();
+  await app.listen({ port: CONFIG.PORT, host: '0.0.0.0' });
+  return app;
+}
+
+if (require.main === module) {
+  startServer().catch((err) => {
     // eslint-disable-next-line no-console
     console.error(err);
     process.exit(1);
   });
+}
+
+module.exports = { buildServer, startServer };

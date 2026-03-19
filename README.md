@@ -19,6 +19,7 @@
 
 ### 🔍 智能监控
 - **多站点管理**：统一管理多个 AI 中转站，支持 NewAPI、Veloera、DoneHub、VOAPI 等主流平台
+- **站点级代理**：支持为单个站点单独配置 HTTP / SOCKS5 代理，自动应用到该站点的所有访问操作
 - **模型变更检测**：自动追踪模型列表的增删改，精确记录每次变化
 - **余额监控**：实时显示账户余额、使用量和剩余额度，支持自定义额度配置
 - **请求详情**：完整记录 API 响应、错误信息和性能数据，便于问题排查
@@ -121,6 +122,8 @@ services:
     environment:
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123456}
+      - JWT_SECRET=${JWT_SECRET:-replace-with-a-random-secret}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-replace-with-a-random-secret}
     volumes:
       - api-monitor-data:/app/data
     restart: unless-stopped
@@ -138,6 +141,8 @@ docker-compose up -d
 # 或自定义管理员账号
 ADMIN_EMAIL=your-email@example.com \
 ADMIN_PASSWORD=your-secure-password \
+JWT_SECRET=$(openssl rand -hex 32) \
+ENCRYPTION_KEY=$(openssl rand -hex 32) \
 docker-compose up -d
 ```
 
@@ -222,7 +227,21 @@ npm start
    - **定时检测**：设置每日自动检测时间
    - **分类**：将站点归类到指定分类
    - **签到配置**：Veloera 类型可启用自动签到
+   - **站点代理**：可选填写 `http(s)://` 或 `socks5://` 代理地址，自动用于该站点全部后端访问
    - **自定义余额**：配置自定义余额查询接口
+
+### 站点代理配置
+
+- 代理字段是可选项，留空时保持直连访问
+- 支持 `http://127.0.0.1:7890`、`http://user:pass@host:port`、`socks5://user:pass@host:port`
+- 代理会统一作用于该站点的模型检测、余额查询、签到、令牌管理、分组读取、兑换码等所有后端请求
+
+### GitHub Actions 发布说明
+
+- 当前 `.github/workflows/docker-publish.yml` 使用 GitHub 自动提供的 `GITHUB_TOKEN` 推送 GHCR，一般不需要额外自定义 Secrets
+- 在你的 fork 仓库中，需要确认 `Settings -> Actions -> General -> Workflow permissions` 设为 **Read and write permissions**
+- 如果要让镜像推送到 `ghcr.io/<你的用户名>/SimpleHub`，还需要确认该仓库允许 GitHub Actions 写入 GitHub Packages
+- 应用运行本身需要关注的环境变量仍然是：`DATABASE_URL`、`ADMIN_EMAIL`、`ADMIN_PASSWORD`、`PORT`、`NODE_ENV`、`JWT_SECRET`、`ENCRYPTION_KEY`
 
 ### 签到功能
 

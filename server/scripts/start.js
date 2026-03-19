@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const { startServer } = require('../src/server');
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -14,5 +15,5 @@ function run(cmd, args) {
     // eslint-disable-next-line no-console
     console.error('Prisma db push failed:', e.message);
   }
-  require('../src/server');
+  await startServer();
 })();

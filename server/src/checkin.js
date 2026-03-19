@@ -1,4 +1,5 @@
 const { decrypt } = require('./crypto');
+const { siteFetch } = require('./site-http');
 
 /**
  * 执行签到（支持 Veloera 和 NewAPI）
@@ -52,7 +53,7 @@ async function performCheckIn(site) {
     console.log(`[签到] 开始签到: ${site.name} (${checkInUrl})`);
     
     // 发起签到请求
-    const response = await fetch(checkInUrl, {
+    const response = await siteFetch(site, checkInUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -158,4 +159,3 @@ module.exports = {
   shouldCheckIn,
   shouldCheckModels
 };
-
