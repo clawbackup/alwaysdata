@@ -8,14 +8,22 @@ const categoryJobs = new Map();  // 用于存储分类定时任务
 const DEFAULT_CRON = '0 9 * * *';
 let globalScheduleJob = null;
 
+function stopSiteJob(siteId, fastify) {
+  if (!jobs.has(siteId)) {
+    return false;
+  }
+
+  jobs.get(siteId).stop();
+  jobs.delete(siteId);
+  fastify?.log?.info({ siteId }, 'Stopped individual site job');
+  return true;
+}
+
 async function scheduleSite(site, fastify) {
   const key = site.id;
   
   // 停止现有任务
-  if (jobs.has(key)) {
-    jobs.get(key).stop();
-    jobs.delete(key);
-  }
+  stopSiteJob(key, fastify);
   
   // 检查全局配置是否启用了覆盖
   const globalConfig = await prisma.scheduleConfig.findFirst();
@@ -79,6 +87,10 @@ function stopAllIndividualJobs(fastify) {
 
 function onSiteUpdated(site, fastify) {
   scheduleSite(site, fastify);
+}
+
+function onSiteDeleted(siteId, fastify) {
+  stopSiteJob(siteId, fastify);
 }
 
 // 为分类调度定时任务
@@ -375,4 +387,4 @@ async function scheduleGlobalTask(config, fastify) {
   fastify?.log?.info({ cronExp: cronExp, timezone: timezone }, 'Global schedule task created and started');
 }
 
-module.exports = { scheduleAll, onSiteUpdated, scheduleGlobalTask, scheduleCategory, scheduleAllCategories };
+module.exports = { scheduleAll, onSiteUpdated, onSiteDeleted, scheduleGlobalTask, scheduleCategory, scheduleAllCategories };

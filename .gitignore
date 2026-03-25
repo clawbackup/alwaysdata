@@ -1,6 +1,5 @@
 # Dependencies
 **/node_modules/
-**/package-lock.json
 **/yarn.lock
 **/pnpm-lock.yaml
 
@@ -50,10 +49,11 @@ coverage/
 *.tmp
 *.temp
 .cache/
+/.claude/
 
 # OS
 .DS_Store
 Thumbs.db
 *.bak
 muban.yaml
-AGENTS.md
+*.md

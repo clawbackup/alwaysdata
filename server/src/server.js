@@ -17,39 +17,25 @@ async function buildServer() {
 
   // Static file path for Docker: /app/web/dist (when __dirname is /app/src)
   const staticRoot = path.join(__dirname, '..', 'web', 'dist');
-  console.log('[Static Files] Checking path:', staticRoot);
-  console.log('[Static Files] Path exists:', fs.existsSync(staticRoot));
-  console.log('[Static Files] __dirname:', __dirname);
+  const hasStaticRoot = fs.existsSync(staticRoot);
+  const indexPath = path.join(staticRoot, 'index.html');
+  const indexHtml = hasStaticRoot && fs.existsSync(indexPath) ? fs.readFileSync(indexPath) : null;
   
-  if (fs.existsSync(staticRoot)) {
+  if (hasStaticRoot) {
     await fastify.register(require('@fastify/static'), {
       root: staticRoot,
       prefix: '/',
       decorateReply: false // 避免冲突
     });
-    console.log('[Static Files] Registered successfully');
-    
-    // 列出静态文件目录内容（调试用）
-    try {
-      const files = fs.readdirSync(staticRoot);
-      console.log('[Static Files] Directory contents:', files);
-    } catch (e) {
-      console.warn('[Static Files] Cannot read directory:', e.message);
-    }
-  } else {
-    console.warn('[Static Files] Directory not found:', staticRoot);
   }
 
   await fastify.register(routes);
 
-  if (fs.existsSync(staticRoot)) {
+  if (indexHtml) {
     fastify.setNotFoundHandler((req, reply) => {
       // For SPA, serve index.html for non-API routes
       if (!req.url.startsWith('/api/')) {
-        const indexPath = path.join(staticRoot, 'index.html');
-        if (fs.existsSync(indexPath)) {
-          return reply.type('text/html').send(fs.readFileSync(indexPath));
-        }
+        return reply.type('text/html').send(indexHtml);
       }
       reply.code(404).send({ error: 'Not found' });
     });

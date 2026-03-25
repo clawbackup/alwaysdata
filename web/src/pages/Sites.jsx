@@ -1,4 +1,4 @@
-import { useEffect, useState, memo, useCallback, useMemo, useRef } from 'react'
+import { useEffect, useState, memo, useCallback, useMemo, useRef, startTransition } from 'react'
 import { Button, Card, Form, Input, Modal, Space, Table, Tag, message, InputNumber, Typography, Popconfirm, TimePicker, Switch, Tooltip, Progress, Select, Collapse, Divider } from 'antd'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { PlusOutlined, EyeOutlined, ThunderboltOutlined, ClockCircleOutlined, GlobalOutlined, EditOutlined, DeleteOutlined, ExclamationCircleOutlined, BugOutlined, MailOutlined, CheckCircleOutlined, PushpinOutlined, PushpinFilled, StopOutlined, DownOutlined, RightOutlined, SearchOutlined, FolderOutlined, AppstoreAddOutlined } from '@ant-design/icons'
@@ -28,16 +28,58 @@ function useIsMobile(breakpoint = 768) {
 }
 
 // 优化的表格组件，避免不必要的重渲染
-const MemoTable = memo(({ dataSource, columns, loading }) => (
-  <Table
-    rowKey="id"
-    dataSource={dataSource}
-    columns={columns}
-    loading={loading}
-    pagination={false}
-    style={{ borderRadius: '0 0 8px 8px' }}
-  />
-))
+const TABLE_VIRTUAL_THRESHOLD = 60
+const TABLE_VIRTUAL_HEIGHT = 720
+const TABLE_TEXT_ELLIPSIS_STYLE = {
+  display: 'block',
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap'
+}
+const COMPACT_ACTION_BUTTON_STYLE = {
+  width: 34,
+  height: 34,
+  paddingInline: 0
+}
+
+const MemoTable = memo(({ dataSource, columns, loading }) => {
+  const enableVirtual = dataSource.length >= TABLE_VIRTUAL_THRESHOLD
+  const scrollConfig = enableVirtual
+    ? { y: TABLE_VIRTUAL_HEIGHT, scrollToFirstRowOnChange: false }
+    : undefined
+
+  return (
+    <Table
+      rowKey="id"
+      dataSource={dataSource}
+      columns={columns}
+      loading={loading}
+      pagination={false}
+      tableLayout="fixed"
+      virtual={enableVirtual}
+      scroll={scrollConfig}
+      style={{ borderRadius: '0 0 8px 8px' }}
+    />
+  )
+})
+
+function sortSites(sites) {
+  return [...sites].sort((left, right) => {
+    if (left.pinned !== right.pinned) {
+      return left.pinned ? -1 : 1
+    }
+
+    const sortOrderDiff = (left.sortOrder ?? 0) - (right.sortOrder ?? 0)
+    if (sortOrderDiff !== 0) {
+      return sortOrderDiff
+    }
+
+    const leftCreatedAt = left.createdAt ? new Date(left.createdAt).getTime() : 0
+    const rightCreatedAt = right.createdAt ? new Date(right.createdAt).getTime() : 0
+    return rightCreatedAt - leftCreatedAt
+  })
+}
 
 function authHeaders(includeJson = false) {
   const t = localStorage.getItem('token');
@@ -82,10 +124,6 @@ export default function Sites() {
   const [scheduleOpen, setScheduleOpen] = useState(false)
   const [scheduleForm] = Form.useForm()
   const [scheduleConfig, setScheduleConfig] = useState({ enabled: false, hour: 9, minute: 0, interval: 30 })
-  const [currentPage, setCurrentPage] = useState(() => {
-    const saved = localStorage.getItem('sitesCurrentPage')
-    return saved ? parseInt(saved, 10) : 1
-  })
   const [batchChecking, setBatchChecking] = useState(false)
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, currentSite: '' })
   const [batchResultOpen, setBatchResultOpen] = useState(false)
@@ -112,29 +150,99 @@ export default function Sites() {
     }
     return new Set(['pinned', 'uncategorized'])
   })
+  const listRef = useRef(list)
+  const searchKeywordRef = useRef(searchKeyword)
+  const collapsedGroupsRef = useRef(collapsedGroups)
   
   const nav = useNavigate()
   const location = useLocation()
 
+  useEffect(() => {
+    listRef.current = list
+  }, [list])
+
+  useEffect(() => {
+    searchKeywordRef.current = searchKeyword
+  }, [searchKeyword])
+
   // 自动保存折叠状态
   useEffect(() => {
+    collapsedGroupsRef.current = collapsedGroups
     sessionStorage.setItem('sitesCollapsedGroups', JSON.stringify([...collapsedGroups]))
   }, [collapsedGroups])
 
-  // 缓存过滤后的站点数据，避免重复计算
-  const pinnedSites = useMemo(() => list.filter(s => s.pinned), [list])
-  const uncategorizedSites = useMemo(() => list.filter(s => !s.categoryId && !s.pinned), [list])
-  
-  // 缓存各分类的站点数据
-  const categorySitesMap = useMemo(() => {
-    const map = new Map()
-    categories.forEach(cat => {
-      map.set(cat.id, list.filter(s => s.categoryId === cat.id && !s.pinned))
-    })
-    return map
+  const categoryLookup = useMemo(() => new Map(categories.map(category => [category.id, category])), [categories])
+
+  // 单次遍历完成分组，避免每个分类都重复 filter 整个列表
+  const { pinnedSites, uncategorizedSites, categorySitesMap } = useMemo(() => {
+    const pinned = []
+    const uncategorized = []
+    const categoryMap = new Map(categories.map(category => [category.id, []]))
+
+    for (const site of list) {
+      if (site.pinned) {
+        pinned.push(site)
+        continue
+      }
+
+      if (site.categoryId && categoryMap.has(site.categoryId)) {
+        categoryMap.get(site.categoryId).push(site)
+        continue
+      }
+
+      uncategorized.push(site)
+    }
+
+    return {
+      pinnedSites: pinned,
+      uncategorizedSites: uncategorized,
+      categorySitesMap: categoryMap
+    }
   }, [list, categories])
 
-  const load = async (search = '') => {
+  const hydrateSite = useCallback((site) => {
+    const nextCategory = site.categoryId ? (categoryLookup.get(site.categoryId) || site.category || null) : null
+    return {
+      billingLimit: null,
+      billingUsage: null,
+      billingError: null,
+      checkInSuccess: null,
+      checkInMessage: null,
+      checkInError: null,
+      ...site,
+      category: nextCategory
+    }
+  }, [categoryLookup])
+
+  const upsertSiteInList = useCallback((site) => {
+    const nextSite = hydrateSite(site)
+    startTransition(() => {
+      setList(prev => {
+        const exists = prev.some(item => item.id === nextSite.id)
+        const nextList = exists
+          ? prev.map(item => item.id === nextSite.id ? { ...item, ...nextSite } : item)
+          : [...prev, nextSite]
+        return sortSites(nextList)
+      })
+    })
+  }, [hydrateSite])
+
+  const removeSitesFromList = useCallback((siteIds) => {
+    const siteIdSet = new Set(siteIds)
+    startTransition(() => {
+      setList(prev => prev.filter(site => !siteIdSet.has(site.id)))
+    })
+  }, [])
+
+  const shouldReloadList = useCallback(() => Boolean(searchKeywordRef.current.trim()), [])
+
+  const handleOpenSiteDetail = useCallback((siteId) => {
+    sessionStorage.setItem('sitesScrollPosition', window.scrollY.toString())
+    sessionStorage.setItem('sitesCollapsedGroups', JSON.stringify([...collapsedGroupsRef.current]))
+    nav(`/sites/${siteId}`)
+  }, [nav])
+
+  const load = useCallback(async (search = '') => {
     setLoading(true)
     try {
       const url = search ? `/api/sites?search=${encodeURIComponent(search)}` : '/api/sites'
@@ -144,21 +252,27 @@ export default function Sites() {
         throw new Error(data.error || '加载站点列表失败')
       }
       const data = await res.json()
-      setList(data)
+      startTransition(() => {
+        setList(data)
+      })
     } catch (e) {
       message.error(e.message || '加载站点列表失败')
     } finally { setLoading(false) }
-  }
+  }, [])
 
   const loadCategories = async () => {
     try {
       const res = await fetch('/api/categories', { headers: authHeaders() })
       if (res.ok) {
         const data = await res.json()
-        setCategories(data)
+        startTransition(() => {
+          setCategories(data)
+        })
         const saved = sessionStorage.getItem('sitesCollapsedGroups')
         if (!saved) {
-          setCollapsedGroups(new Set(['pinned', 'uncategorized', ...data.map(c => c.id)]))
+          startTransition(() => {
+            setCollapsedGroups(new Set(['pinned', 'uncategorized', ...data.map(c => c.id)]))
+          })
         }
       }
     } catch (e) {
@@ -167,14 +281,16 @@ export default function Sites() {
   }
 
   const toggleGroupCollapse = useCallback((groupId) => {
-    setCollapsedGroups(prev => {
-      const newCollapsed = new Set(prev)
-      if (newCollapsed.has(groupId)) {
-        newCollapsed.delete(groupId)
-      } else {
-        newCollapsed.add(groupId)
-      }
-      return newCollapsed
+    startTransition(() => {
+      setCollapsedGroups(prev => {
+        const newCollapsed = new Set(prev)
+        if (newCollapsed.has(groupId)) {
+          newCollapsed.delete(groupId)
+        } else {
+          newCollapsed.add(groupId)
+        }
+        return newCollapsed
+      })
     })
   }, [])
 
@@ -281,6 +397,10 @@ export default function Sites() {
           const err = await res.json().catch(() => ({}))
           throw new Error(err.error || '更新分类失败')
         }
+        const updatedCategory = await res.json()
+        startTransition(() => {
+          setCategories(prev => prev.map(category => category.id === updatedCategory.id ? updatedCategory : category))
+        })
         message.success('分类更新成功')
       } else {
         // 创建分类
@@ -293,13 +413,20 @@ export default function Sites() {
           const err = await res.json().catch(() => ({}))
           throw new Error(err.error || '创建分类失败')
         }
+        const createdCategory = await res.json()
+        startTransition(() => {
+          setCategories(prev => [...prev, createdCategory].sort((left, right) => {
+            const leftTime = left.createdAt ? new Date(left.createdAt).getTime() : 0
+            const rightTime = right.createdAt ? new Date(right.createdAt).getTime() : 0
+            return leftTime - rightTime
+          }))
+        })
         message.success('分类创建成功')
       }
 
       setCategoryModalOpen(false)
       setEditingCategory(null)
       categoryForm.resetFields()
-      await loadCategories()
     } catch (e) {
       message.error(e.message || '保存失败')
     }
@@ -315,9 +442,13 @@ export default function Sites() {
         const err = await res.json().catch(() => ({}))
         throw new Error(err.error || '删除分类失败')
       }
+      startTransition(() => {
+        setCategories(prev => prev.filter(category => category.id !== categoryId))
+        setList(prev => prev.map(site => site.categoryId === categoryId
+          ? { ...site, categoryId: null, category: null }
+          : site))
+      })
       message.success('分类删除成功')
-      await loadCategories()
-      await load(searchKeyword)
     } catch (e) {
       message.error(e.message || '删除失败')
     }
@@ -557,13 +688,21 @@ export default function Sites() {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || '创建站点失败')
       }
-      setOpen(false); form.resetFields(); await load(); message.success('站点创建成功')
+      const createdSite = await res.json()
+      setOpen(false)
+      form.resetFields()
+      if (shouldReloadList()) {
+        await load(searchKeywordRef.current)
+      } else {
+        upsertSiteInList(createdSite)
+      }
+      message.success('站点创建成功')
     } catch (e) {
       message.error(e.message || '创建站点失败')
     }
   }
 
-  const openEditModal = async (site) => {
+  const openEditModal = useCallback(async (site) => {
     try {
       const res = await fetch(`/api/sites/${site.id}`, { headers: authHeaders() })
       if (!res.ok) {
@@ -613,7 +752,7 @@ export default function Sites() {
     } catch (e) {
       message.error(e.message || '获取站点详情失败')
     }
-  }
+  }, [form])
 
   const onEdit = async () => {
     try {
@@ -661,8 +800,6 @@ export default function Sites() {
         updateData.timezone = 'UTC'
       }
 
-      console.log('更新数据:', updateData)
-
       const res = await fetch(`/api/sites/${editingSite.id}`, {
         method: 'PATCH',
         headers: authHeaders(true),
@@ -673,19 +810,24 @@ export default function Sites() {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || '更新站点失败')
       }
+      const updatedSite = await res.json()
 
       setOpen(false)
       setEditMode(false)
       setEditingSite(null)
       form.resetFields()
-      await load()
+      if (shouldReloadList()) {
+        await load(searchKeywordRef.current)
+      } else {
+        upsertSiteInList(updatedSite)
+      }
       message.success('站点更新成功')
     } catch (e) {
       message.error(e.message || '更新站点失败，请检查输入信息')
     }
   }
 
-  const onDelete = async (site) => {
+  const onDelete = useCallback(async (site) => {
     try {
       const res = await fetch(`/api/sites/${site.id}`, {
         method: 'DELETE',
@@ -697,12 +839,16 @@ export default function Sites() {
         throw new Error(data.error || '删除站点失败')
       }
 
-      await load()
+      if (shouldReloadList()) {
+        await load(searchKeywordRef.current)
+      } else {
+        removeSitesFromList([site.id])
+      }
       message.success(`站点"${site.name}"已删除`)
     } catch (e) {
       message.error(e.message || '删除站点失败')
     }
-  }
+  }, [load, removeSitesFromList, shouldReloadList])
 
   const deleteUncategorizedSites = async () => {
     try {
@@ -723,11 +869,15 @@ export default function Sites() {
 
       const results = await Promise.allSettled(deletePromises)
       
-      // 统计成功和失败的数量
-      const successCount = results.filter(r => r.status === 'fulfilled').length
+      const successfulIds = uncategorizedSites
+        .filter((_, index) => results[index]?.status === 'fulfilled')
+        .map(site => site.id)
+      const successCount = successfulIds.length
       const failCount = results.length - successCount
 
-      await load()
+      if (successfulIds.length > 0) {
+        removeSitesFromList(successfulIds)
+      }
       
       if (failCount === 0) {
         message.success(`已成功删除 ${successCount} 个未分类站点`)
@@ -755,7 +905,7 @@ export default function Sites() {
     form.resetFields()
   }
 
-  const onCheck = async (id) => {
+  const onCheck = useCallback(async (id) => {
     const hide = message.loading('正在检测中...', 0)
     try {
       const res = await fetch(`/api/sites/${id}/check?skipNotification=true`, { method: 'POST', headers: authHeaders() })
@@ -764,7 +914,7 @@ export default function Sites() {
       hide()
       
       if (data.hasChanges && data.diff) {
-        const site = list.find(s => s.id === id)
+        const site = listRef.current.find(s => s.id === id)
         const siteName = site?.name || '未知站点'
         
         Modal.info({
@@ -833,12 +983,12 @@ export default function Sites() {
         message.success('检测完成，无模型变更')
       }
       
-      await load()
+      await load(searchKeywordRef.current)
     } catch (e) {
       hide()
       message.error(e.message || '检测失败，请检查站点配置')
     }
-  }
+  }, [load])
 
   const onCheckAllSites = async () => {
     if (list.length === 0) {
@@ -906,7 +1056,7 @@ export default function Sites() {
     setBatchProgress({ current: 0, total: 0, currentSite: '' })
 
     // 刷新列表
-    await load()
+    await load(searchKeywordRef.current)
 
     // 保存结果到 state 和 localStorage
     const results = {
@@ -929,7 +1079,7 @@ export default function Sites() {
     setBatchResultOpen(true)
   }
 
-  const openTimeModal = (r) => {
+  const openTimeModal = useCallback((r) => {
     setTimeSite(r)
     let h = undefined, m = undefined
     if (r.scheduleCron && r.timezone === 'Asia/Shanghai') {
@@ -938,7 +1088,7 @@ export default function Sites() {
     }
     timeForm.setFieldsValue({ cnHour: h, cnMinute: m })
     setTimeOpen(true)
-  }
+  }, [timeForm])
 
   const saveTime = async () => {
     try {
@@ -960,7 +1110,11 @@ export default function Sites() {
           const data = await res.json().catch(() => ({}))
           throw new Error(data.error || '保存失败')
         }
-        setTimeOpen(false); setTimeSite(null); await load(); message.success('已取消定时检测')
+        const updatedSite = await res.json()
+        setTimeOpen(false)
+        setTimeSite(null)
+        upsertSiteInList(updatedSite)
+        message.success('已取消定时检测')
       } else if ((hour !== undefined && hour !== null) && (minute !== undefined && minute !== null)) {
         // 设置定时计划
         const cron = hmToCron(hour, minute)
@@ -973,7 +1127,11 @@ export default function Sites() {
           const data = await res.json().catch(() => ({}))
           throw new Error(data.error || '保存失败')
         }
-        setTimeOpen(false); setTimeSite(null); await load(); message.success('检测时间设置成功')
+        const updatedSite = await res.json()
+        setTimeOpen(false)
+        setTimeSite(null)
+        upsertSiteInList(updatedSite)
+        message.success('检测时间设置成功')
       } else {
         message.error('请输入完整的时间（小时和分钟）或留空取消定时检测')
       }
@@ -1004,24 +1162,22 @@ export default function Sites() {
   }, [])
 
   // 更新站点排序
-  const updateSortOrder = async (siteId, newValue) => {
-    console.log('更新排序:', siteId, newValue);
+  const updateSortOrder = useCallback(async (siteId, newValue) => {
     try {
       const res = await fetch(`/api/sites/${siteId}`, {
         method: 'PATCH',
         headers: authHeaders(true),
         body: JSON.stringify({ sortOrder: Number(newValue) })
-      });
-      const data = await res.json();
-      console.log('更新结果:', data);
-      if (!res.ok) throw new Error(data.error || '更新失败');
-      message.success('排序已更新');
-      await load(searchKeyword);
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || '更新失败')
+      upsertSiteInList(data)
+      message.success('排序已更新')
     } catch (e) {
-      console.error('更新排序失败:', e);
-      message.error('更新排序失败');
+      console.error('更新排序失败:', e)
+      message.error('更新排序失败')
     }
-  };
+  }, [upsertSiteInList])
 
   // 移动端站点卡片组件 - 使用 useCallback 优化
   const renderMobileSiteCard = useCallback((site) => {
@@ -1067,7 +1223,7 @@ export default function Sites() {
             {site.lastCheckedAt ? new Date(site.lastCheckedAt).toLocaleString('zh-CN') : '未检测'}
           </Typography.Text>
           <Space size={4}>
-            <Button size="small" icon={<EyeOutlined />} onClick={() => { sessionStorage.setItem('sitesScrollPosition', window.scrollY.toString()); nav(`/sites/${site.id}`); }} />
+            <Button size="small" icon={<EyeOutlined />} onClick={() => handleOpenSiteDetail(site.id)} />
             <Button size="small" icon={<ThunderboltOutlined />} style={{ color: '#52c41a', borderColor: '#52c41a' }} onClick={() => onCheck(site.id)} />
             <Button size="small" icon={<EditOutlined />} style={{ color: '#1890ff', borderColor: '#1890ff' }} onClick={() => openEditModal(site)} />
             <Popconfirm title="确定删除？" onConfirm={() => onDelete(site)} okText="删除" cancelText="取消">
@@ -1077,7 +1233,7 @@ export default function Sites() {
         </div>
       </Card>
     );
-  }, [nav, onCheck, openEditModal, onDelete]);
+  }, [handleOpenSiteDetail, onCheck, openEditModal, onDelete]);
 
   // 移动端站点列表（支持展开/折叠）
   const renderMobileSiteList = useCallback((sites, title, titleColor = '#1890ff', icon, groupId) => {
@@ -1118,7 +1274,7 @@ export default function Sites() {
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>排序</span>,
       dataIndex: 'sortOrder',
-      width: 70,
+      width: 64,
       align: 'center',
       render: (value, record) => (
         <InputNumber
@@ -1127,15 +1283,16 @@ export default function Sites() {
           min={0}
           max={9999}
           defaultValue={value ?? 0}
-          style={{ width: 50 }}
+          controls={false}
+          style={{ width: 46 }}
           onBlur={(e) => {
-            const newValue = parseInt(e.target.value, 10) || 0;
+            const newValue = parseInt(e.target.value, 10) || 0
             if (newValue !== (value ?? 0)) {
-              updateSortOrder(record.id, newValue);
+              updateSortOrder(record.id, newValue)
             }
           }}
           onPressEnter={(e) => {
-            e.target.blur();
+            e.target.blur()
           }}
         />
       )
@@ -1143,248 +1300,286 @@ export default function Sites() {
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>名称</span>,
       dataIndex: 'name',
-      width: 200,
+      width: 150,
       render: (text, record) => (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <Tooltip title={record.baseUrl} placement="topLeft">
-              <Typography.Link
-                href={record.baseUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                strong
-                style={{ fontSize: 15, color: '#40a9ff' }}
-              >
-                {text}
-              </Typography.Link>
-            </Tooltip>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <Tooltip title={record.baseUrl} placement="topLeft">
+                <Typography.Link
+                  href={record.baseUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  strong
+                  style={{
+                    ...TABLE_TEXT_ELLIPSIS_STYLE,
+                    fontSize: 15,
+                    color: '#40a9ff'
+                  }}
+                >
+                  {text}
+                </Typography.Link>
+              </Tooltip>
+            </div>
             {record.pinned && (
               <Tooltip title="已置顶">
-                <PushpinFilled style={{ color: '#fa8c16', fontSize: 13 }} />
+                <PushpinFilled style={{ color: '#fa8c16', fontSize: 13, flex: '0 0 auto' }} />
               </Tooltip>
             )}
             {record.excludeFromBatch && (
               <Tooltip title="不参与一键检测">
-                <span style={{ fontSize: 14, cursor: 'help' }}>🚫</span>
+                <StopOutlined style={{ fontSize: 13, color: '#ff4d4f', flex: '0 0 auto' }} />
               </Tooltip>
             )}
           </div>
           {record.extralink && (
-            <Typography.Link
-              href={record.extralink}
-              target="_blank"
-              rel="noopener noreferrer"
-              type="secondary"
-              style={{ fontSize: 11 }}
-            >
-              {record.extralink}
-            </Typography.Link>
+            <Tooltip title={record.extralink} placement="topLeft">
+              <Typography.Link
+                href={record.extralink}
+                target="_blank"
+                rel="noopener noreferrer"
+                type="secondary"
+                style={{
+                  ...TABLE_TEXT_ELLIPSIS_STYLE,
+                  fontSize: 11
+                }}
+              >
+                {record.extralink}
+              </Typography.Link>
+            </Tooltip>
           )}
         </div>
       )
     },
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>用量</span>,
-      width: 200,
+      width: 168,
       align: 'center',
       render: (_, record) => {
-        const { billingLimit, billingUsage, billingError, unlimitedQuota } = record;
+        const { billingLimit, billingUsage, billingError, unlimitedQuota } = record
 
-        // 无限余额站点
         if (unlimitedQuota) {
-          return <Tooltip title="此站点标记为无限余额">
-            <div style={{
-              display: 'inline-block',
-              padding: '4px 8px',
-              borderRadius: 6,
-              background: 'linear-gradient(45deg, #ffd700, #ffed4e, #ffd700, #ffed4e)',
-              backgroundSize: '200% 200%',
-              animation: 'shimmer 2s ease-in-out infinite',
-              border: '1px solid #ffd700',
-              fontSize: 11,
-              fontWeight: 600,
-              color: '#b8860b',
-              cursor: 'help'
-            }}>
-              ♾️ 无限余额
-            </div>
-          </Tooltip>;
+          return (
+            <Tooltip title="此站点标记为无限余额">
+              <div style={{
+                display: 'inline-block',
+                padding: '4px 8px',
+                borderRadius: 6,
+                background: 'linear-gradient(45deg, #ffd700, #ffed4e, #ffd700, #ffed4e)',
+                backgroundSize: '200% 200%',
+                animation: 'shimmer 2s ease-in-out infinite',
+                border: '1px solid #ffd700',
+                fontSize: 11,
+                fontWeight: 600,
+                color: '#b8860b',
+                cursor: 'help'
+              }}>
+                ♾️ 无限余额
+              </div>
+            </Tooltip>
+          )
         }
 
         if (billingError) {
-          return <Tooltip title={billingError}>
-            <Tag color="default" style={{ fontSize: 11, margin: 0, color: '#999', borderColor: '#d9d9d9' }}>无法获取</Tag>
-          </Tooltip>;
+          return (
+            <Tooltip title={billingError}>
+              <Tag color="default" style={{ fontSize: 11, margin: 0, color: '#999', borderColor: '#d9d9d9' }}>
+                无法获取
+              </Tag>
+            </Tooltip>
+          )
         }
 
         if (typeof billingLimit === 'number' && typeof billingUsage === 'number') {
-          const remaining = billingLimit - billingUsage;
-          const percentage = (billingUsage / billingLimit) * 100;
-          let color = '#52c41a';
-          let bgColor = '#f6ffed';
-          let barColor = '#52c41a';
+          const remaining = billingLimit - billingUsage
+          const percentage = (billingUsage / billingLimit) * 100
+          let color = '#52c41a'
+          let bgColor = '#f6ffed'
+          let barColor = '#52c41a'
           if (percentage > 90) {
-            color = '#ff4d4f';
-            bgColor = '#fff2f0';
-            barColor = '#ff4d4f';
+            color = '#ff4d4f'
+            bgColor = '#fff2f0'
+            barColor = '#ff4d4f'
           } else if (percentage > 70) {
-            color = '#fa8c16';
-            bgColor = '#fff7e6';
-            barColor = '#fa8c16';
+            color = '#fa8c16'
+            bgColor = '#fff7e6'
+            barColor = '#fa8c16'
           }
 
-          return <Tooltip title={`总额: $${billingLimit.toFixed(2)} | 已用: $${billingUsage.toFixed(1)} | 剩余: $${remaining.toFixed(2)} (${(100 - percentage).toFixed(1)}%)`}>
-            <div style={{
-              width: '100%',
-              padding: '6px 10px',
-              borderRadius: 6,
-              backgroundColor: bgColor,
-              border: `1px solid ${color}20`,
-              cursor: 'help'
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                <span style={{ fontSize: 11, color: '#666', fontWeight: 500 }}>剩余</span>
-                <span style={{ fontSize: 14, fontWeight: 700, color }}>${remaining.toFixed(2)}</span>
-              </div>
+          return (
+            <Tooltip title={`总额: $${billingLimit.toFixed(2)} | 已用: $${billingUsage.toFixed(1)} | 剩余: $${remaining.toFixed(2)} (${(100 - percentage).toFixed(1)}%)`}>
               <div style={{
-                height: 4,
-                backgroundColor: '#f0f0f0',
-                borderRadius: 2,
-                overflow: 'hidden',
-                marginBottom: 4
+                width: '100%',
+                padding: '6px 8px',
+                borderRadius: 6,
+                backgroundColor: bgColor,
+                border: `1px solid ${color}20`,
+                cursor: 'help'
               }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: '#666', fontWeight: 500 }}>剩余</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color }}>${remaining.toFixed(2)}</span>
+                </div>
                 <div style={{
-                  height: '100%',
-                  width: `${100 - percentage}%`,
-                  backgroundColor: barColor,
-                  transition: 'width 0.3s ease'
-                }} />
+                  height: 4,
+                  backgroundColor: '#f0f0f0',
+                  borderRadius: 2,
+                  overflow: 'hidden',
+                  marginBottom: 4
+                }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${100 - percentage}%`,
+                    backgroundColor: barColor,
+                    transition: 'width 0.3s ease'
+                  }} />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#999' }}>
+                  <span>已用 ${billingUsage.toFixed(1)}</span>
+                  <span>总额 ${billingLimit.toFixed(2)}</span>
+                </div>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#999' }}>
-                <span>已用 ${billingUsage.toFixed(1)}</span>
-                <span>总额 ${billingLimit.toFixed(2)}</span>
-              </div>
-            </div>
-          </Tooltip>;
+            </Tooltip>
+          )
         }
 
         if (typeof billingLimit === 'number') {
-          return <Tooltip title="总额度">
-            <Tag color="blue" style={{ fontSize: 11, margin: 0 }}>💳 ${billingLimit.toFixed(2)}</Tag>
-          </Tooltip>;
+          return (
+            <Tooltip title="总额度">
+              <Tag color="blue" style={{ fontSize: 11, margin: 0 }}>💳 ${billingLimit.toFixed(2)}</Tag>
+            </Tooltip>
+          )
         }
 
         if (typeof billingUsage === 'number') {
-          return <Tooltip title="已使用">
-            <Tag color="orange" style={{ fontSize: 11, margin: 0 }}>📈 ${billingUsage.toFixed(1)}</Tag>
-          </Tooltip>;
+          return (
+            <Tooltip title="已使用">
+              <Tag color="orange" style={{ fontSize: 11, margin: 0 }}>📈 ${billingUsage.toFixed(1)}</Tag>
+            </Tooltip>
+          )
         }
 
-        return <Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text>;
+        return <Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text>
       }
     },
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>签到</span>,
-      width: 80,
+      width: 72,
       align: 'center',
       render: (_, record) => {
-        const { apiType, enableCheckIn, checkInSuccess, checkInMessage, checkInError } = record;
+        const { apiType, enableCheckIn, checkInSuccess, checkInMessage, checkInError } = record
 
-        // 只有Veloera和NewAPI类型才显示签到状态
         if (apiType !== 'veloera' && apiType !== 'newapi') {
           return <Tooltip title="此站点类型不支持签到">
             <span style={{ fontSize: 32, color: '#d9d9d9', cursor: 'help', fontWeight: 'bold', lineHeight: 1 }}>●</span>
-          </Tooltip>;
+          </Tooltip>
         }
 
-        // 未启用签到
         if (!enableCheckIn) {
           return <Tooltip title="未启用签到">
             <span style={{ fontSize: 32, color: '#d9d9d9', cursor: 'help', fontWeight: 'bold', lineHeight: 1 }}>●</span>
-          </Tooltip>;
+          </Tooltip>
         }
 
-        // 签到成功
         if (checkInSuccess === true) {
           return <Tooltip title={`签到成功: ${checkInMessage || '成功'}`}>
             <CheckCircleOutlined style={{ fontSize: 32, color: '#52c41a', cursor: 'help' }} />
-          </Tooltip>;
+          </Tooltip>
         }
 
-        // 签到失败
         if (checkInSuccess === false) {
           return <Tooltip title={`签到失败: ${checkInError || checkInMessage || '失败'}`}>
             <span style={{ fontSize: 32, color: '#ff4d4f', cursor: 'help', fontWeight: 'bold', lineHeight: 1 }}>✖</span>
-          </Tooltip>;
+          </Tooltip>
         }
 
-        // 已启用但暂无签到记录
         return <Tooltip title="已启用签到，暂无签到记录">
           <span style={{ fontSize: 32, color: '#faad14', cursor: 'help', fontWeight: 'bold', lineHeight: 1 }}>●</span>
-        </Tooltip>;
+        </Tooltip>
       }
     },
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>定时计划</span>,
-      width: 250,
+      width: 180,
       align: 'center',
       render: (_, r) => {
-        // 检查全局是否启用了覆盖模式
         if (scheduleConfig?.enabled && scheduleConfig.overrideIndividual) {
           const h = String(scheduleConfig.hour).padStart(2, '0')
           const m = String(scheduleConfig.minute).padStart(2, '0')
           return <Tooltip title="全局配置已启用覆盖模式，此站点的单独配置被忽略，使用全局配置">
-            <Tag color="orange" icon={<ClockCircleOutlined />} style={{ fontSize: 14, cursor: 'help' }}>
-              全局覆盖 北京时间 <b>{h}:{m}</b>
+            <Tag color="orange" icon={<ClockCircleOutlined />} style={{ fontSize: 12, cursor: 'help', margin: 0, maxWidth: '100%' }}>
+              全局覆盖 {h}:{m}
             </Tag>
           </Tooltip>
         }
 
-        // 优先显示站点单独配置（单独调度，单独通知）
         if (r.scheduleCron && r.scheduleCron.trim()) {
           if (r.timezone === 'Asia/Shanghai') {
             return <Tooltip title="此站点有单独的定时配置，会单独调度、单独发送邮件通知">
-              <Tag color="blue" icon={<ClockCircleOutlined />} style={{ fontSize: 14, cursor: 'help' }}>
-                单独 北京时间 <b>{cronToHm(r.scheduleCron)}</b>
+              <Tag color="blue" icon={<ClockCircleOutlined />} style={{ fontSize: 12, cursor: 'help', margin: 0, maxWidth: '100%' }}>
+                单独 {cronToHm(r.scheduleCron)}
               </Tag>
             </Tooltip>
           }
           return <Tooltip title="此站点有单独的定时配置，会单独调度、单独发送邮件通知">
-            <Space><Tag color="blue" style={{ fontSize: 13, cursor: 'help' }}>单独配置</Tag><Tag style={{ fontSize: 13 }}>{r.scheduleCron}</Tag><Tag color="default" style={{ fontSize: 13 }}>{r.timezone || 'UTC'}</Tag></Space>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 1.3 }}>
+              <Tag color="blue" style={{ fontSize: 12, cursor: 'help', margin: 0, alignSelf: 'center' }}>单独配置</Tag>
+              <Typography.Text style={{ ...TABLE_TEXT_ELLIPSIS_STYLE, fontSize: 11, color: '#8c8c8c' }}>
+                {r.scheduleCron} / {r.timezone || 'UTC'}
+              </Typography.Text>
+            </div>
           </Tooltip>
         }
-        // 没有单独配置，显示全局配置（聚合通知）
+
         if (scheduleConfig?.enabled) {
           const h = String(scheduleConfig.hour).padStart(2, '0')
           const m = String(scheduleConfig.minute).padStart(2, '0')
           return <Tooltip title="此站点使用全局定时配置，会与其他站点一起检测、聚合发送邮件通知">
-            <Tag color="cyan" icon={<ClockCircleOutlined />} style={{ fontSize: 14, cursor: 'help' }}>
-              全局 北京时间 <b>{h}:{m}</b>
+            <Tag color="cyan" icon={<ClockCircleOutlined />} style={{ fontSize: 12, cursor: 'help', margin: 0, maxWidth: '100%' }}>
+              全局 {h}:{m}
             </Tag>
           </Tooltip>
         }
-        // 都没有配置
-        return <Tag color="default" style={{ fontSize: 13 }}>未配置定时检测</Tag>
+
+        return <Typography.Text type="secondary" style={{ fontSize: 12 }}>未配置</Typography.Text>
       }
     },
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>上次检测</span>,
       dataIndex: 'lastCheckedAt',
-      width: 180,
+      width: 136,
       align: 'center',
-      render: v => v
-        ? <Typography.Text type="secondary" style={{ fontSize: 13, whiteSpace: 'nowrap' }}>{new Date(v).toLocaleString('zh-CN')}</Typography.Text>
-        : <Typography.Text type="secondary" style={{ fontSize: 13 }}>未检测</Typography.Text>
+      render: (v) => {
+        if (!v) {
+          return <Typography.Text type="secondary" style={{ fontSize: 12 }}>未检测</Typography.Text>
+        }
+
+        const text = new Date(v).toLocaleString('zh-CN')
+        const [datePart, timePart] = text.split(' ')
+        return (
+          <div style={{ lineHeight: 1.35 }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+              {datePart}
+            </Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+              {timePart || ''}
+            </Typography.Text>
+          </div>
+        )
+      }
     },
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>备注</span>,
       dataIndex: 'remark',
-      width: 220,
-      align: 'center',
+      width: 120,
       render: (text) => text ? (
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        <Typography.Paragraph
+          type="secondary"
+          style={{ fontSize: 12, margin: 0 }}
+          ellipsis={{ rows: 2, tooltip: text }}
+        >
           {text}
-        </Typography.Text>
+        </Typography.Paragraph>
       ) : (
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>-</Typography.Text>
       )
@@ -1392,23 +1587,19 @@ export default function Sites() {
     {
       title: <span style={{ fontSize: 15, fontWeight: 600 }}>操作</span>,
       key: 'actions',
-      width: 240,
+      width: 126,
       align: 'center',
       render: (_, r) => (
         <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <div style={{ display: 'inline-grid', gridTemplateColumns: 'repeat(3, auto)', gap: '2px 2px' }}>
+          <div style={{ display: 'inline-grid', gridTemplateColumns: 'repeat(3, 34px)', gap: 4 }}>
             <Tooltip title="查看详情">
               <Button
                 type="primary"
                 className="hover-lift"
                 icon={<EyeOutlined />}
-                onClick={() => {
-                  localStorage.setItem('sitesCurrentPage', currentPage)
-                  sessionStorage.setItem('sitesScrollPosition', window.scrollY.toString())
-                  sessionStorage.setItem('sitesCollapsedGroups', JSON.stringify([...collapsedGroups]))
-                  nav(`/sites/${r.id}`)
-                }}
-                size="middle"
+                onClick={() => handleOpenSiteDetail(r.id)}
+                size="small"
+                style={COMPACT_ACTION_BUTTON_STYLE}
               />
             </Tooltip>
             <Tooltip title="立即检测">
@@ -1417,8 +1608,8 @@ export default function Sites() {
                 className="hover-lift"
                 icon={<ThunderboltOutlined />}
                 onClick={() => onCheck(r.id)}
-                size="middle"
-                style={{ color: '#52c41a', fontWeight: 600, borderColor: '#52c41a' }}
+                size="small"
+                style={{ ...COMPACT_ACTION_BUTTON_STYLE, color: '#52c41a', fontWeight: 600, borderColor: '#52c41a' }}
               />
             </Tooltip>
             <Tooltip title="请求详情">
@@ -1426,8 +1617,8 @@ export default function Sites() {
                 type="default"
                 icon={<BugOutlined />}
                 onClick={() => openDebugModal(r)}
-                size="middle"
-                style={{ color: '#fa8c16', borderColor: '#fa8c16' }}
+                size="small"
+                style={{ ...COMPACT_ACTION_BUTTON_STYLE, color: '#fa8c16', borderColor: '#fa8c16' }}
               />
             </Tooltip>
             <Tooltip title="设置时间">
@@ -1435,7 +1626,8 @@ export default function Sites() {
                 type="default"
                 icon={<ClockCircleOutlined />}
                 onClick={() => openTimeModal(r)}
-                size="middle"
+                size="small"
+                style={COMPACT_ACTION_BUTTON_STYLE}
               />
             </Tooltip>
             <Tooltip title="编辑">
@@ -1443,8 +1635,8 @@ export default function Sites() {
                 type="default"
                 icon={<EditOutlined />}
                 onClick={() => openEditModal(r)}
-                size="middle"
-                style={{ color: '#1890ff', borderColor: '#1890ff' }}
+                size="small"
+                style={{ ...COMPACT_ACTION_BUTTON_STYLE, color: '#1890ff', borderColor: '#1890ff' }}
               />
             </Tooltip>
             <Popconfirm
@@ -1467,7 +1659,8 @@ export default function Sites() {
                 <Button
                   danger
                   icon={<DeleteOutlined />}
-                  size="middle"
+                  size="small"
+                  style={COMPACT_ACTION_BUTTON_STYLE}
                 />
               </Tooltip>
             </Popconfirm>
@@ -1475,7 +1668,7 @@ export default function Sites() {
         </div>
       )
     }
-  ], [currentPage, collapsedGroups, nav, onCheck, openDebugModal, openTimeModal, openEditModal, onDelete, scheduleConfig, updateSortOrder])
+  ], [handleOpenSiteDetail, onCheck, openDebugModal, openTimeModal, openEditModal, onDelete, scheduleConfig, updateSortOrder])
 
   return (
     <Card
@@ -1658,6 +1851,7 @@ export default function Sites() {
               columns={columns}
               loading={loading}
               pagination={{ pageSize: 10, showSizeChanger: false, showTotal: (total) => `共 ${total} 个站点` }}
+              tableLayout="fixed"
               style={{ marginTop: 8 }}
             />
           )}
@@ -1928,7 +2122,7 @@ export default function Sites() {
                     description={
                       <div style={{ maxWidth: 350 }}>
                         <p style={{ marginBottom: 12 }}>
-                          你即将删除 <strong style={{ color: '#ff4d4f', fontSize: 16 }}>{list.filter(s => !s.categoryId && !s.pinned).length} 个</strong> 未分类站点
+                          你即将删除 <strong style={{ color: '#ff4d4f', fontSize: 16 }}>{uncategorizedSites.length} 个</strong> 未分类站点
                         </p>
                         <div style={{ 
                           background: '#fff1f0', 

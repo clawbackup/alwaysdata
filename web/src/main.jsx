@@ -1,12 +1,13 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import App from './pages/App'
-import Login from './pages/Login'
-import Sites from './pages/Sites'
-import SiteDetail from './pages/SiteDetail'
 import 'antd/dist/reset.css'
 import './index.css'
+
+const App = React.lazy(() => import('./pages/App'))
+const Login = React.lazy(() => import('./pages/Login'))
+const Sites = React.lazy(() => import('./pages/Sites'))
+const SiteDetail = React.lazy(() => import('./pages/SiteDetail'))
 
 function RequireAuth({ children }) {
   const token = localStorage.getItem('token')
@@ -17,13 +18,15 @@ function RequireAuth({ children }) {
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route path="/" element={<RequireAuth><App /></RequireAuth>}>
-          <Route index element={<Sites />} />
-          <Route path="sites/:id" element={<SiteDetail />} />
-        </Route>
-      </Routes>
+      <React.Suspense fallback={<div style={{ padding: 32, textAlign: 'center', color: '#666' }}>页面加载中...</div>}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/" element={<RequireAuth><App /></RequireAuth>}>
+            <Route index element={<Sites />} />
+            <Route path="sites/:id" element={<SiteDetail />} />
+          </Route>
+        </Routes>
+      </React.Suspense>
     </BrowserRouter>
   </React.StrictMode>
 )

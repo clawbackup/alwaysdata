@@ -2,9 +2,62 @@ const path = require('path');
 const { authPlugin } = require('./auth');
 const { prisma } = require('./db');
 const { encrypt, decrypt } = require('./crypto');
-const { onSiteUpdated, scheduleGlobalTask } = require('./scheduler');
+const { onSiteUpdated, onSiteDeleted, scheduleGlobalTask } = require('./scheduler');
 const { checkSiteById } = require('./run');
 const { normalizeProxyUrl, parseProxyUrl, siteFetch } = require('./site-http');
+
+const SITE_LIST_ORDER = [
+  { pinned: 'desc' },
+  { sortOrder: 'asc' },
+  { createdAt: 'desc' }
+];
+
+const SITE_LIST_SELECT = {
+  id: true,
+  name: true,
+  baseUrl: true,
+  apiType: true,
+  userId: true,
+  billingUrl: true,
+  billingAuthType: true,
+  billingLimitField: true,
+  billingUsageField: true,
+  unlimitedQuota: true,
+  enableCheckIn: true,
+  checkInMode: true,
+  scheduleCron: true,
+  timezone: true,
+  pinned: true,
+  excludeFromBatch: true,
+  categoryId: true,
+  extralink: true,
+  remark: true,
+  sortOrder: true,
+  lastCheckedAt: true,
+  createdAt: true,
+  category: {
+    select: {
+      id: true,
+      name: true,
+      scheduleCron: true,
+      timezone: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  }
+};
+
+const SITE_SNAPSHOT_SELECT = {
+  siteId: true,
+  fetchedAt: true,
+  billingLimit: true,
+  billingUsage: true,
+  billingError: true,
+  modelsJson: true,
+  checkInSuccess: true,
+  checkInMessage: true,
+  checkInError: true
+};
 
 function decryptOptional(value, fieldName, fastify) {
   if (!value) return null;
@@ -24,6 +77,93 @@ function encryptProxyUrl(proxyUrl) {
   return encrypt(normalized);
 }
 
+function normalizeManagedTokenKey(token) {
+  if (typeof token !== 'string') return token;
+
+  const trimmedToken = token.trim();
+  if (!trimmedToken) return trimmedToken;
+
+  return trimmedToken.startsWith('sk-') ? trimmedToken : `sk-${trimmedToken}`;
+}
+
+function serializeManagedTokenKey(token) {
+  if (typeof token !== 'string') return token;
+
+  const trimmedToken = token.trim();
+  if (!trimmedToken) return trimmedToken;
+
+  return trimmedToken.startsWith('sk-') ? trimmedToken.slice(3) : trimmedToken;
+}
+
+function normalizeManagedTokenRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return record;
+  }
+
+  if (!('key' in record)) {
+    return record;
+  }
+
+  return {
+    ...record,
+    key: normalizeManagedTokenKey(record.key)
+  };
+}
+
+function normalizeManagedTokenResponse(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return data;
+  }
+
+  if (Array.isArray(data.data)) {
+    return {
+      ...data,
+      data: data.data.map(normalizeManagedTokenRecord)
+    };
+  }
+
+  if (!data.data || typeof data.data !== 'object' || Array.isArray(data.data)) {
+    return data;
+  }
+
+  if (Array.isArray(data.data.items)) {
+    return {
+      ...data,
+      data: {
+        ...data.data,
+        items: data.data.items.map(normalizeManagedTokenRecord)
+      }
+    };
+  }
+
+  if (Array.isArray(data.data.data)) {
+    return {
+      ...data,
+      data: {
+        ...data.data,
+        data: data.data.data.map(normalizeManagedTokenRecord)
+      }
+    };
+  }
+
+  return data;
+}
+
+function serializeManagedTokenPayload(tokenData) {
+  if (!tokenData || typeof tokenData !== 'object' || Array.isArray(tokenData)) {
+    return tokenData;
+  }
+
+  if (!('key' in tokenData)) {
+    return tokenData;
+  }
+
+  return {
+    ...tokenData,
+    key: serializeManagedTokenKey(tokenData.key)
+  };
+}
+
 function getSiteDetailResponse(site, fastify) {
   const token = decryptOptional(site.apiKeyEnc, 'API key', fastify);
   const billingAuthValue = decryptOptional(site.billingAuthValue, 'billing auth value', fastify);
@@ -38,6 +178,114 @@ function getSiteDetailResponse(site, fastify) {
     billingAuthValue,
     proxyUrl
   };
+}
+
+function stripSiteSearchModels(site) {
+  const { _modelsJson, ...rest } = site;
+  return rest;
+}
+
+function siteMatchesSearch(site, searchLower) {
+  if (site.name.toLowerCase().includes(searchLower)) return true;
+  if (site.baseUrl.toLowerCase().includes(searchLower)) return true;
+
+  if (!site._modelsJson) {
+    return false;
+  }
+
+  try {
+    const models = JSON.parse(site._modelsJson);
+    if (!Array.isArray(models)) {
+      return false;
+    }
+
+    return models.some(model => model.id && model.id.toLowerCase().includes(searchLower));
+  } catch (error) {
+    return false;
+  }
+}
+
+async function getLatestSuccessfulSnapshots(siteIds) {
+  if (!siteIds.length) {
+    return new Map();
+  }
+
+  const latestSnapshotTimes = await prisma.modelSnapshot.groupBy({
+    by: ['siteId'],
+    where: {
+      siteId: { in: siteIds },
+      errorMessage: null
+    },
+    _max: {
+      fetchedAt: true
+    }
+  });
+
+  const snapshotLookupConditions = latestSnapshotTimes
+    .filter(row => row._max.fetchedAt)
+    .map(row => ({
+      siteId: row.siteId,
+      fetchedAt: row._max.fetchedAt,
+      errorMessage: null
+    }));
+
+  if (!snapshotLookupConditions.length) {
+    return new Map();
+  }
+
+  const snapshots = await prisma.modelSnapshot.findMany({
+    where: {
+      OR: snapshotLookupConditions
+    },
+    select: SITE_SNAPSHOT_SELECT
+  });
+
+  const snapshotMap = new Map();
+  for (const snapshot of snapshots) {
+    const current = snapshotMap.get(snapshot.siteId);
+    if (!current || snapshot.fetchedAt > current.fetchedAt) {
+      snapshotMap.set(snapshot.siteId, snapshot);
+    }
+  }
+
+  return snapshotMap;
+}
+
+function buildSiteListResponse(sites, snapshotMap) {
+  return sites.map(site => {
+    const latestSnapshot = snapshotMap.get(site.id);
+    return {
+      ...site,
+      billingLimit: latestSnapshot?.billingLimit ?? null,
+      billingUsage: latestSnapshot?.billingUsage ?? null,
+      billingError: latestSnapshot?.billingError ?? null,
+      checkInSuccess: latestSnapshot?.checkInSuccess ?? null,
+      checkInMessage: latestSnapshot?.checkInMessage ?? null,
+      checkInError: latestSnapshot?.checkInError ?? null,
+      _modelsJson: latestSnapshot?.modelsJson || '[]'
+    };
+  });
+}
+
+function buildCategoryExportData(categories) {
+  return categories.map(category => ({
+    name: category.name,
+    scheduleCron: category.scheduleCron,
+    timezone: category.timezone
+  }));
+}
+
+function buildSiteExportData(sites) {
+  return sites.map(site => {
+    const { apiKeyEnc, billingAuthValue, proxyUrlEnc, categoryId, category, ...siteData } = site;
+    return {
+      ...siteData,
+      apiKey: apiKeyEnc ? decrypt(apiKeyEnc) : null,
+      billingAuthValue: billingAuthValue ? decrypt(billingAuthValue) : null,
+      proxyUrl: proxyUrlEnc ? decrypt(proxyUrlEnc) : null,
+      categoryName: category ? category.name : null
+    };
+  });
 }
 
 async function routes(fastify) {
@@ -55,107 +303,43 @@ async function routes(fastify) {
 
   fastify.get('/api/sites', async (request) => {
     const { search } = request.query || {};
-    
-    // 获取所有站点
-    const sites = await prisma.site.findMany({ 
-      orderBy: [{ pinned: 'desc' }, { sortOrder: 'asc' }, { createdAt: 'desc' }],
-      include: { category: true }
+
+    const sites = await prisma.site.findMany({
+      orderBy: SITE_LIST_ORDER,
+      select: SITE_LIST_SELECT
     });
-    
-    // 为每个站点获取最新的billing信息和模型信息
-    const sitesWithBilling = await Promise.all(sites.map(async (site) => {
-      const latestSnapshot = await prisma.modelSnapshot.findFirst({
-        where: { 
-          siteId: site.id,
-          errorMessage: null  // 只取成功的快照
-        },
-        orderBy: { fetchedAt: 'desc' },
-        select: { billingLimit: true, billingUsage: true, billingError: true, modelsJson: true, checkInSuccess: true, checkInMessage: true, checkInError: true }
-      });
-      
-      // 调试日志
-      if (latestSnapshot) {
-        fastify.log.info({ 
-          siteName: site.name, 
-          billingLimit: latestSnapshot.billingLimit, 
-          billingUsage: latestSnapshot.billingUsage,
-          billingError: latestSnapshot.billingError
-        }, 'Billing data found for site');
-      } else {
-        fastify.log.info({ siteName: site.name }, 'No snapshot found for site');
-      }
-      
-      const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...rest } = site;
-      return {
-        ...rest,
-        billingLimit: latestSnapshot?.billingLimit ?? null,
-        billingUsage: latestSnapshot?.billingUsage ?? null,
-        billingError: latestSnapshot?.billingError ?? null,
-        checkInSuccess: latestSnapshot?.checkInSuccess ?? null,
-        checkInMessage: latestSnapshot?.checkInMessage ?? null,
-        checkInError: latestSnapshot?.checkInError ?? null,
-        _modelsJson: latestSnapshot?.modelsJson || '[]' // 用于搜索
-      };
-    }));
-    
+    const snapshotMap = await getLatestSuccessfulSnapshots(sites.map(site => site.id));
+    const sitesWithBilling = buildSiteListResponse(sites, snapshotMap);
+
     // 如果有搜索关键词，进行过滤
     if (search && search.trim()) {
       const searchLower = search.trim().toLowerCase();
-      return sitesWithBilling.filter(site => {
-        // 搜索站点名称
-        if (site.name.toLowerCase().includes(searchLower)) return true;
-        // 搜索站点链接
-        if (site.baseUrl.toLowerCase().includes(searchLower)) return true;
-        // 搜索模型ID
-        try {
-          const models = JSON.parse(site._modelsJson);
-          if (Array.isArray(models)) {
-            return models.some(model => model.id && model.id.toLowerCase().includes(searchLower));
-          }
-        } catch (e) {
-          // 忽略JSON解析错误
-        }
-        return false;
-      }).map(site => {
-        // 移除临时的_modelsJson字段
-        const { _modelsJson, ...rest } = site;
-        return rest;
-      });
+      return sitesWithBilling
+        .filter(site => siteMatchesSearch(site, searchLower))
+        .map(stripSiteSearchModels);
     }
-    
-    // 移除临时的_modelsJson字段
-    return sitesWithBilling.map(site => {
-      const { _modelsJson, ...rest } = site;
-      return rest;
-    });
+
+    return sitesWithBilling.map(stripSiteSearchModels);
   });
 
   // 导出站点（必须在 /api/sites/:id 之前）
   fastify.get('/api/sites/export', async (request, reply) => {
     try {
-      const sites = await prisma.site.findMany({
-        orderBy: [{ pinned: 'desc' }, { sortOrder: 'asc' }, { createdAt: 'desc' }],
-        include: { category: true }
-      });
-      
-      // 不导出加密的敏感信息，导出原始apiKey和billingAuthValue
-      const exportData = sites.map(site => {
-        const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...siteData } = site;
-        return {
-          ...siteData,
-          apiKey: apiKeyEnc ? decrypt(apiKeyEnc) : null,
-          billingAuthValue: billingAuthValue ? decrypt(billingAuthValue) : null,
-          proxyUrl: proxyUrlEnc ? decrypt(proxyUrlEnc) : null,
-          // 导出分类名称而不是ID
-          categoryName: site.category ? site.category.name : null,
-          category: undefined // 移除category对象
-        };
-      });
+      const [sites, categories] = await Promise.all([
+        prisma.site.findMany({
+          orderBy: SITE_LIST_ORDER,
+          include: { category: true }
+        }),
+        prisma.category.findMany({
+          orderBy: { createdAt: 'asc' }
+        })
+      ]);
 
       return {
-        version: '1.1',
+        version: '1.2',
         exportDate: new Date().toISOString(),
-        sites: exportData
+        categories: buildCategoryExportData(categories),
+        sites: buildSiteExportData(sites)
       };
     } catch (e) {
       fastify.log.error(e);
@@ -167,27 +351,21 @@ async function routes(fastify) {
   // 导出站点别名，避免与 /api/sites/:id 动态路由潜在冲突
   fastify.get('/api/exports/sites', async (request, reply) => {
     try {
-      const sites = await prisma.site.findMany({
-        orderBy: [{ pinned: 'desc' }, { sortOrder: 'asc' }, { createdAt: 'desc' }],
-        include: { category: true }
-      });
-
-      const exportData = sites.map(site => {
-        const { apiKeyEnc, billingAuthValue, proxyUrlEnc, ...siteData } = site;
-        return {
-          ...siteData,
-          apiKey: apiKeyEnc ? decrypt(apiKeyEnc) : null,
-          billingAuthValue: billingAuthValue ? decrypt(billingAuthValue) : null,
-          proxyUrl: proxyUrlEnc ? decrypt(proxyUrlEnc) : null,
-          categoryName: site.category ? site.category.name : null,
-          category: undefined
-        };
-      });
+      const [sites, categories] = await Promise.all([
+        prisma.site.findMany({
+          orderBy: SITE_LIST_ORDER,
+          include: { category: true }
+        }),
+        prisma.category.findMany({
+          orderBy: { createdAt: 'asc' }
+        })
+      ]);
 
       return {
-        version: '1.1',
+        version: '1.2',
         exportDate: new Date().toISOString(),
-        sites: exportData
+        categories: buildCategoryExportData(categories),
+        sites: buildSiteExportData(sites)
       };
     } catch (e) {
       fastify.log.error(e);
@@ -205,13 +383,14 @@ async function routes(fastify) {
         properties: {
           version: { type: 'string' },
           exportDate: { type: 'string' },
+          categories: { type: 'array' },
           sites: { type: 'array' }
         }
       }
     }
   }, async (request, reply) => {
     try {
-      const { sites } = request.body;
+      const { sites, categories: importedCategories = [] } = request.body;
       
       if (!Array.isArray(sites) || sites.length === 0) {
         reply.code(400);
@@ -221,9 +400,49 @@ async function routes(fastify) {
       let imported = 0;
       const errors = [];
       
-      // 先获取所有分类，用于匹配分类名称
-      const categories = await prisma.category.findMany();
-      const categoryMap = new Map(categories.map(c => [c.name, c.id]));
+      // 先获取所有分类，用于匹配和恢复分类
+      const existingCategories = await prisma.category.findMany();
+      const categoryMap = new Map(existingCategories.map(c => [c.name, c.id]));
+      const importedCategoryMap = new Map(
+        Array.isArray(importedCategories)
+          ? importedCategories
+              .filter(category => category && typeof category.name === 'string' && category.name.trim())
+              .map(category => [category.name.trim(), category])
+          : []
+      );
+      const { scheduleCategory } = require('./scheduler');
+
+      const ensureCategory = async (categoryName) => {
+        if (!categoryName || typeof categoryName !== 'string') {
+          return null;
+        }
+
+        const normalizedCategoryName = categoryName.trim();
+        if (!normalizedCategoryName) {
+          return null;
+        }
+
+        if (categoryMap.has(normalizedCategoryName)) {
+          return categoryMap.get(normalizedCategoryName);
+        }
+
+        const importedCategory = importedCategoryMap.get(normalizedCategoryName);
+        const createdCategory = await prisma.category.create({
+          data: {
+            name: normalizedCategoryName,
+            scheduleCron: importedCategory?.scheduleCron ?? null,
+            timezone: importedCategory?.timezone || 'Asia/Shanghai'
+          }
+        });
+
+        categoryMap.set(createdCategory.name, createdCategory.id);
+        await scheduleCategory(createdCategory, fastify);
+        return createdCategory.id;
+      };
+
+      for (const category of importedCategoryMap.values()) {
+        await ensureCategory(category.name);
+      }
       
       for (const siteData of sites) {
         try {
@@ -242,11 +461,8 @@ async function routes(fastify) {
             continue;
           }
           
-          // 匹配分类
-          let categoryId = null;
-          if (categoryName && categoryMap.has(categoryName)) {
-            categoryId = categoryMap.get(categoryName);
-          }
+          const resolvedCategoryName = categoryName || category?.name || null;
+          const categoryId = await ensureCategory(resolvedCategoryName);
           
           // 加密敏感信息
           const apiKeyEnc = encrypt(apiKey);
@@ -458,9 +674,12 @@ async function routes(fastify) {
     schema: { params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
   }, async (request) => {
     const { id } = request.params;
-    await prisma.modelDiff.deleteMany({ where: { siteId: id } });
-    await prisma.modelSnapshot.deleteMany({ where: { siteId: id } });
-    await prisma.site.delete({ where: { id } });
+    await prisma.$transaction([
+      prisma.modelDiff.deleteMany({ where: { siteId: id } }),
+      prisma.modelSnapshot.deleteMany({ where: { siteId: id } }),
+      prisma.site.delete({ where: { id } })
+    ]);
+    onSiteDeleted(id, fastify);
     return { ok: true };
   });
 
@@ -670,7 +889,7 @@ async function routes(fastify) {
         const convertedData = records.map(record => ({
           id: record.id,
           name: record.name,
-          key: record.token,
+          key: normalizeManagedTokenKey(record.token),
           group: record.groups && record.groups.length > 0 ? String(record.groups[0]) : '',
           expired_time: record.expireTime === 4102329600000 ? -1 : Math.floor(record.expireTime / 1000),
           unlimited_quota: record.boundlessAmount,
@@ -715,7 +934,7 @@ async function routes(fastify) {
         throw new Error(data.message || '获取令牌列表失败');
       }
       
-      return data;
+      return normalizeManagedTokenResponse(data);
       }
     } catch (e) {
       fastify.log.error({ error: e.message, siteId: id }, 'Error fetching tokens');
@@ -953,7 +1172,7 @@ async function routes(fastify) {
           enable: true,
           expireTime: tokenData.expired_time === -1 ? 4102329600000 : (tokenData.expired_time * 1000),
           groups: groupValue ? [parseInt(groupValue)] : [1],
-          token: tokenData.key,
+          token: serializeManagedTokenKey(tokenData.key),
           uid: tokenData.uid || 0,
           used: tokenData.used_quota ? String(tokenData.used_quota / 500000) : "0"
         };
@@ -979,7 +1198,7 @@ async function routes(fastify) {
           }
         }
         
-        payload = tokenData;
+        payload = serializeManagedTokenPayload(tokenData);
       }
       
       const res = await siteFetch(site, url, {

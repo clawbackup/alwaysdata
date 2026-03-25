@@ -1,66 +1,57 @@
-# Build web frontend
+# 构建前端静态资源
 FROM node:18-alpine AS webbuild
 WORKDIR /web
-COPY web/package*.json ./
-# 安装所有依赖（包括 devDependencies，因为需要 vite 等构建工具）
-RUN npm ci || npm install
-COPY web/ ./
-RUN npm run build
 
-# Build server and generate Prisma client
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY web/ ./
+RUN npm run build && npm cache clean --force
+
+# 构建服务端并生成 Prisma Client
 FROM node:18-alpine AS serverbuild
 WORKDIR /server
-COPY server/package*.json ./
-# 先安装所有依赖以生成 Prisma client
-RUN npm ci || npm install
+
+COPY server/package.json server/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
 COPY server/prisma ./prisma
 RUN npx prisma generate
-COPY server/ ./
-# 清理 devDependencies 以减小体积
-RUN npm prune --production
 
-# Final production image (use Debian-based image for better Prisma compatibility)
-FROM node:18-slim AS runtime
+COPY server/src ./src
+COPY server/scripts ./scripts
+RUN npm prune --omit=dev && npm cache clean --force
+
+# 生产运行镜像
+FROM node:18-alpine AS runtime
 LABEL maintainer="AI Model Monitor"
 LABEL description="AI中转站模型监测系统"
 
 WORKDIR /app
 
-# Install OpenSSL for Prisma
-RUN apt-get update && \
-    apt-get install -y openssl ca-certificates && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Set production environment
 ENV NODE_ENV=production \
     PORT=3000 \
     DATABASE_URL="file:/app/data/db.sqlite"
 
-# Create non-root user and data directory
-RUN useradd -m -d /app -s /bin/bash appuser && \
-    mkdir -p /app/data && \
-    chown -R appuser:appuser /app
+RUN apk add --no-cache openssl \
+    && addgroup -S appgroup \
+    && adduser -S appuser -G appgroup \
+    && mkdir -p /app/data /app/prisma /app/web/dist \
+    && chown -R appuser:appgroup /app
 
-# Copy application files
-COPY --from=serverbuild --chown=appuser:appuser /server /app
-COPY --from=webbuild --chown=appuser:appuser /web/dist /app/web/dist
+COPY --from=serverbuild --chown=appuser:appgroup /server/package.json ./package.json
+COPY --from=serverbuild --chown=appuser:appgroup /server/node_modules ./node_modules
+COPY --from=serverbuild --chown=appuser:appgroup /server/src ./src
+COPY --from=serverbuild --chown=appuser:appgroup /server/scripts ./scripts
+COPY --from=serverbuild --chown=appuser:appgroup /server/prisma ./prisma
+COPY --from=webbuild --chown=appuser:appgroup /web/dist ./web/dist
 
-# Verify files were copied
-RUN ls -la /app && ls -la /app/web && ls -la /app/web/dist || true
-
-# Switch to non-root user
 USER appuser
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:${PORT}/', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+  CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 3000) + '/', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-# Expose port
 EXPOSE 3000
-
-# Volume for persistent data
 VOLUME ["/app/data"]
 
-# Start application
 CMD ["node", "scripts/start.js"]

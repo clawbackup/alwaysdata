@@ -457,11 +457,70 @@ body {
   border: 1px solid #ffe58f !important;
 }
 
-/* Respect reduced motion */
+/* 尊重系统减少动态效果设置 */
 @media (prefers-reduced-motion: reduce) {
-  * {
+  .fade-in,
+  .fade-in-up,
+  .slide-in-right,
+  .shimmer-effect {
+    animation: none !important;
+  }
+
+  .ant-btn,
+  .ant-btn-primary,
+  .ant-card,
+  .ant-collapse-item,
+  .ant-collapse-header,
+  .ant-input,
+  .ant-input-password,
+  .ant-input-number,
+  .ant-select-selector,
+  .ant-picker,
+  .ant-tag,
+  .ant-statistic,
+  .ant-modal-close,
+  .ant-spin-container,
+  .hover-lift,
+  ::-webkit-scrollbar-thumb {
+    transition: none !important;
+  }
+
+  .ant-btn:hover,
+  .ant-btn-primary:hover,
+  .ant-card-hoverable:hover,
+  .ant-modal-close:hover,
+  .ant-tag:hover,
+  .hover-lift:hover {
+    transform: none !important;
+  }
+
+  /* 系统关闭动画时，确保 Ant Design 弹层直接进入最终可见态 */
+  :is(
+    .ant-zoom-enter,
+    .ant-zoom-appear,
+    .ant-zoom-big-enter,
+    .ant-zoom-big-appear,
+    .ant-zoom-big-fast-enter,
+    .ant-zoom-big-fast-appear,
+    .ant-fade-enter,
+    .ant-fade-appear,
+    .ant-move-up-enter,
+    .ant-move-up-appear,
+    .ant-move-down-enter,
+    .ant-move-down-appear,
+    .ant-slide-up-enter,
+    .ant-slide-up-appear,
+    .ant-slide-down-enter,
+    .ant-slide-down-appear,
+    .ant-slide-left-enter,
+    .ant-slide-left-appear,
+    .ant-slide-right-enter,
+    .ant-slide-right-appear
+  ) {
     animation: none !important;
     transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
   }
 }
 

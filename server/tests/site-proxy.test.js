@@ -54,10 +54,13 @@ function createUpstreamServer() {
 
     req.on('data', (chunk) => bodyChunks.push(chunk));
     req.on('end', () => {
+      const rawBody = Buffer.concat(bodyChunks).toString('utf8');
       requests.push({
         path: url.pathname,
         method: req.method,
-        viaProxy: req.headers['x-through-proxy'] === 'yes'
+        viaProxy: req.headers['x-through-proxy'] === 'yes',
+        authorization: req.headers.authorization || '',
+        body: rawBody ? JSON.parse(rawBody) : null
       });
 
       res.setHeader('Content-Type', 'application/json');
@@ -78,12 +81,76 @@ function createUpstreamServer() {
       }
 
       if (url.pathname === '/api/token/') {
-        res.end(JSON.stringify({ success: true, data: [{ id: 1, key: 'tok-1' }] }));
+        if (req.method === 'GET') {
+          res.end(JSON.stringify({ success: true, data: [{ id: 1, key: 'tok-1' }] }));
+          return;
+        }
+
+        if (req.method === 'PUT') {
+          res.end(JSON.stringify({ success: true }));
+          return;
+        }
+
         return;
       }
 
       res.statusCode = 404;
       res.end(JSON.stringify({ error: `Unhandled path: ${url.pathname}` }));
+    });
+  });
+
+  return { server, requests };
+}
+
+function createVoapiTokenServer() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const bodyChunks = [];
+
+    req.on('data', (chunk) => bodyChunks.push(chunk));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(bodyChunks).toString('utf8');
+      const requestRecord = {
+        path: url.pathname,
+        method: req.method,
+        authorization: req.headers.authorization || '',
+        body: rawBody ? JSON.parse(rawBody) : null
+      };
+
+      requests.push(requestRecord);
+      res.setHeader('Content-Type', 'application/json');
+
+      if (url.pathname === '/api/keys' && req.method === 'GET') {
+        res.end(JSON.stringify({
+          code: 0,
+          data: {
+            records: [{
+              id: 1,
+              name: 'voapi-token',
+              token: '60Wy9oMtcZGCk1jXja0IH8PzqUgvS9moQASE7iM3CjNU6WSt',
+              groups: [2],
+              expireTime: 4102329600000,
+              boundlessAmount: false,
+              amount: '1.00',
+              used: '0.25',
+              enable: true,
+              created: 1710000000000,
+              updated: 1710003600000,
+              uid: 8
+            }]
+          }
+        }));
+        return;
+      }
+
+      if (url.pathname === '/api/keys/1' && req.method === 'PUT') {
+        res.end(JSON.stringify({ code: 0, message: 'ok' }));
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end(JSON.stringify({ code: 404, message: `Unhandled path: ${url.pathname}` }));
     });
   });
 
@@ -243,11 +310,21 @@ async function createSite(payload) {
 test.before(async () => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'simplehub-site-proxy-'));
   process.env.DATABASE_URL = `file:${path.join(tempDir, 'db.sqlite')}`;
+  process.env.RUST_BACKTRACE = '1';
+  process.env.RUST_LOG = 'info';
+  process.env.PRISMA_HIDE_UPDATE_MESSAGE = '1';
+  const prismaCommand = path.join(
+    serverRoot,
+    'node_modules',
+    '.bin',
+    process.platform === 'win32' ? 'prisma.cmd' : 'prisma'
+  );
 
-  execFileSync('npx', ['prisma', 'db', 'push', '--force-reset', '--skip-generate'], {
+  execFileSync(prismaCommand, ['db', 'push', '--force-reset', '--skip-generate'], {
     cwd: serverRoot,
     env: process.env,
-    stdio: 'inherit'
+    stdio: 'inherit',
+    shell: process.platform === 'win32'
   });
 
   ({ buildServer } = require('../src/server'));
@@ -265,6 +342,7 @@ test.afterEach(async () => {
   await prisma.modelDiff.deleteMany();
   await prisma.modelSnapshot.deleteMany();
   await prisma.site.deleteMany();
+  await prisma.category.deleteMany();
 });
 
 test('site-http validates proxy URLs and attaches proxy agents', async () => {
@@ -429,5 +507,179 @@ test('newapi site check solves BunkerWeb challenge through per-site proxy', asyn
       new Promise((resolve) => proxy.server.close(resolve)),
       new Promise((resolve) => upstream.server.close(resolve))
     ]);
+  }
+});
+
+test('site export and import preserve categories', async () => {
+  const category = await prisma.category.create({
+    data: {
+      name: '已分类站点',
+      scheduleCron: null,
+      timezone: 'Asia/Shanghai'
+    }
+  });
+
+  const createdSite = await createSite({
+    name: 'categorized-site',
+    baseUrl: 'http://127.0.0.1:18080',
+    apiKey: 'sk-export-test',
+    apiType: 'other',
+    categoryId: category.id
+  });
+
+  const exportResponse = await app.inject({
+    method: 'GET',
+    url: '/api/exports/sites'
+  });
+
+  assert.equal(exportResponse.statusCode, 200, exportResponse.body);
+  const exportedData = exportResponse.json();
+
+  assert.equal(exportedData.version, '1.2');
+  assert.ok(Array.isArray(exportedData.categories));
+  assert.equal(exportedData.categories.length, 1);
+  assert.deepEqual(exportedData.categories[0], {
+    name: '已分类站点',
+    scheduleCron: null,
+    timezone: 'Asia/Shanghai'
+  });
+  assert.equal(exportedData.sites.length, 1);
+  assert.equal(exportedData.sites[0].name, createdSite.name);
+  assert.equal(exportedData.sites[0].categoryName, '已分类站点');
+  assert.equal('categoryId' in exportedData.sites[0], false);
+
+  await prisma.site.deleteMany();
+  await prisma.category.deleteMany();
+
+  const importResponse = await app.inject({
+    method: 'POST',
+    url: '/api/sites/import',
+    payload: exportedData
+  });
+
+  assert.equal(importResponse.statusCode, 200, importResponse.body);
+  assert.equal(importResponse.json().imported, 1);
+  assert.equal(importResponse.json().errors, undefined);
+
+  const restoredCategory = await prisma.category.findUnique({
+    where: { name: '已分类站点' }
+  });
+  assert.ok(restoredCategory);
+  assert.equal(restoredCategory.scheduleCron, null);
+  assert.equal(restoredCategory.timezone, 'Asia/Shanghai');
+
+  const restoredSite = await prisma.site.findFirst({
+    where: { name: 'categorized-site' },
+    include: { category: true }
+  });
+  assert.ok(restoredSite);
+  assert.equal(restoredSite.categoryId, restoredCategory.id);
+  assert.equal(restoredSite.category?.name, '已分类站点');
+});
+
+test('generic token routes normalize sk prefix for display and strip it on update', async () => {
+  const upstream = createUpstreamServer();
+  const upstreamPort = await listen(upstream.server);
+
+  try {
+    const site = await createSite({
+      name: 'generic-token-site',
+      baseUrl: `http://127.0.0.1:${upstreamPort}`,
+      apiKey: 'sk-generic-admin',
+      apiType: 'other'
+    });
+
+    const tokensResponse = await app.inject({
+      method: 'GET',
+      url: `/api/sites/${site.id}/tokens`
+    });
+
+    assert.equal(tokensResponse.statusCode, 200, tokensResponse.body);
+    assert.equal(tokensResponse.json().success, true);
+    assert.equal(tokensResponse.json().data[0].key, 'sk-tok-1');
+
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${site.id}/tokens`,
+      payload: {
+        id: 1,
+        name: 'token-1',
+        key: 'sk-tok-1',
+        group: '',
+        expired_time: -1,
+        unlimited_quota: false,
+        remain_quota: 1000,
+        model_limits_enabled: false,
+        model_limits: '',
+        allow_ips: ''
+      }
+    });
+
+    assert.equal(updateResponse.statusCode, 200, updateResponse.body);
+    assert.equal(updateResponse.json().success, true);
+
+    const listRequest = upstream.requests.find((request) => request.path === '/api/token/' && request.method === 'GET');
+    assert.equal(listRequest.authorization, 'Bearer sk-generic-admin');
+
+    const updateRequest = upstream.requests.find((request) => request.path === '/api/token/' && request.method === 'PUT');
+    assert.equal(updateRequest.authorization, 'Bearer sk-generic-admin');
+    assert.equal(updateRequest.body.key, 'tok-1');
+  } finally {
+    await new Promise((resolve) => upstream.server.close(resolve));
+  }
+});
+
+test('voapi token routes normalize sk prefix for display and strip it on update', async () => {
+  const upstream = createVoapiTokenServer();
+  const upstreamPort = await listen(upstream.server);
+
+  try {
+    const site = await createSite({
+      name: 'voapi-site',
+      baseUrl: `http://127.0.0.1:${upstreamPort}`,
+      apiKey: 'sk-voapi-models',
+      apiType: 'voapi',
+      billingAuthValue: 'voapi-jwt-token'
+    });
+
+    const tokensResponse = await app.inject({
+      method: 'GET',
+      url: `/api/sites/${site.id}/tokens`
+    });
+
+    assert.equal(tokensResponse.statusCode, 200, tokensResponse.body);
+    assert.equal(tokensResponse.json().success, true);
+    assert.equal(
+      tokensResponse.json().data[0].key,
+      'sk-60Wy9oMtcZGCk1jXja0IH8PzqUgvS9moQASE7iM3CjNU6WSt'
+    );
+
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/sites/${site.id}/tokens`,
+      payload: {
+        id: 1,
+        name: 'voapi-token',
+        group: '2',
+        expired_time: -1,
+        unlimited_quota: false,
+        remain_quota: 500000,
+        key: 'sk-60Wy9oMtcZGCk1jXja0IH8PzqUgvS9moQASE7iM3CjNU6WSt',
+        uid: 8,
+        used_quota: 125000
+      }
+    });
+
+    assert.equal(updateResponse.statusCode, 200, updateResponse.body);
+    assert.equal(updateResponse.json().success, true);
+
+    const listRequest = upstream.requests.find((request) => request.path === '/api/keys' && request.method === 'GET');
+    assert.equal(listRequest.authorization, 'voapi-jwt-token');
+
+    const updateRequest = upstream.requests.find((request) => request.path === '/api/keys/1' && request.method === 'PUT');
+    assert.equal(updateRequest.authorization, 'voapi-jwt-token');
+    assert.equal(updateRequest.body.token, '60Wy9oMtcZGCk1jXja0IH8PzqUgvS9moQASE7iM3CjNU6WSt');
+  } finally {
+    await new Promise((resolve) => upstream.server.close(resolve));
   }
 });

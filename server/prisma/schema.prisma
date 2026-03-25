@@ -1,6 +1,6 @@
 generator client {
   provider = "prisma-client-js"
-  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-arm64-openssl-3.0.x"]
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x"]
 }
 
 datasource db {
@@ -45,6 +45,9 @@ model Site {
   createdAt         DateTime         @default(now())
   snapshots         ModelSnapshot[]
   diffs             ModelDiff[]
+
+  @@index([categoryId])
+  @@index([pinned, sortOrder, createdAt])
 }
 
 model ModelSnapshot {
@@ -67,6 +70,9 @@ model ModelSnapshot {
   checkInError        String?  // 签到错误信息
   diffsFrom           ModelDiff[] @relation("SnapshotFrom")
   diffsTo             ModelDiff[] @relation("SnapshotTo")
+
+  @@index([siteId, fetchedAt])
+  @@index([siteId, errorMessage, fetchedAt])
 }
 
 model ModelDiff {
@@ -81,6 +87,8 @@ model ModelDiff {
   snapshotFrom    ModelSnapshot? @relation("SnapshotFrom", fields: [snapshotFromId], references: [id])
   snapshotToId    String?
   snapshotTo      ModelSnapshot? @relation("SnapshotTo", fields: [snapshotToId], references: [id])
+
+  @@index([siteId, diffAt])
 }
 
 model EmailConfig {
