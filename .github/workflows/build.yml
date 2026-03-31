@@ -1,0 +1,61 @@
+name: build-simplehub
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout SimpleHub
+        uses: actions/checkout@v4
+        with:
+          repository: jwy87/SimpleHub
+          path: SimpleHub-src
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build backend
+        working-directory: SimpleHub-src/server
+        run: |
+          npm install --no-audit --no-fund
+          npx prisma generate
+
+      - name: Build frontend
+        working-directory: SimpleHub-src/web
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Pack
+        run: |
+          mkdir -p release/SimpleHub
+          cp -r SimpleHub-src/server release/SimpleHub/
+          mkdir -p release/SimpleHub/server/web
+          rm -rf release/SimpleHub/server/web/dist
+          cp -r SimpleHub-src/web/dist release/SimpleHub/server/web/
+
+          cat > release/SimpleHub/run-simplehub.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$HOME/SimpleHub/server"
+          export PORT="${PORT:-8100}"
+          export HOST="${HOST:-0.0.0.0}"
+          export IP="${IP:-0.0.0.0}"
+          export NODE_ENV="${NODE_ENV:-production}"
+          export DATABASE_URL="${DATABASE_URL:-file:./data/db.sqlite}"
+          exec npm start
+          EOF
+
+          chmod +x release/SimpleHub/run-simplehub.sh
+          tar -C release -czf simplehub-prebuilt.tar.gz SimpleHub
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simplehub-prebuilt
+          path: simplehub-prebuilt.tar.gz
