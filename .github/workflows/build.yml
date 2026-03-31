@@ -11,16 +11,8 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout deploy repo
+      - name: Checkout current repo
         uses: actions/checkout@v4
-        with:
-          path: deploy-repo
-
-      - name: Checkout SimpleHub
-        uses: actions/checkout@v4
-        with:
-          repository: clawbackup/SimpleHub
-          path: SimpleHub-src
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -28,13 +20,13 @@ jobs:
           node-version: 20
 
       - name: Build backend
-        working-directory: SimpleHub-src/server
+        working-directory: server
         run: |
           npm install --no-audit --no-fund
           npx prisma generate
 
       - name: Build frontend
-        working-directory: SimpleHub-src/web
+        working-directory: web
         run: |
           npm install --no-audit --no-fund
           npm run build
@@ -43,18 +35,17 @@ jobs:
         run: |
           rm -rf release
           mkdir -p release/SimpleHub
-          cp -r SimpleHub-src/server release/SimpleHub/
+          cp -r server release/SimpleHub/
           mkdir -p release/SimpleHub/server/web
           rm -rf release/SimpleHub/server/web/dist
-          cp -r SimpleHub-src/web/dist release/SimpleHub/server/web/
+          cp -r web/dist release/SimpleHub/server/web/
 
           cat > release/SimpleHub/run-simplehub.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
           cd "$HOME/SimpleHub/server"
           export PORT="${PORT:-8100}"
-          export HOST="${HOST:-0.0.0.0}"
-          export IP="${IP:-0.0.0.0}"
+          export HOST="${HOST:-${IP:-::}}"
           export NODE_ENV="${NODE_ENV:-production}"
           export DATABASE_URL="${DATABASE_URL:-file:./data/db.sqlite}"
           exec npm start
@@ -64,10 +55,9 @@ jobs:
           tar -C release -czf simplehub-prebuilt.tar.gz SimpleHub
 
       - name: Publish release
-        working-directory: deploy-repo
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete latest-build -y || true
           git push origin :refs/tags/latest-build || true
-          gh release create latest-build ../simplehub-prebuilt.tar.gz --title latest-build --notes "auto build"
+          gh release create latest-build simplehub-prebuilt.tar.gz --title latest-build --notes "auto build"
