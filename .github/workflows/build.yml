@@ -3,6 +3,9 @@ name: build-simplehub
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -54,8 +57,12 @@ jobs:
           chmod +x release/SimpleHub/run-simplehub.sh
           tar -C release -czf simplehub-prebuilt.tar.gz SimpleHub
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: simplehub-prebuilt
-          path: simplehub-prebuilt.tar.gz
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=latest-build
+          gh release delete "$TAG" -y || true
+          git tag -d "$TAG" || true
+          git push origin ":refs/tags/$TAG" || true
+          gh release create "$TAG" simplehub-prebuilt.tar.gz --title "$TAG" --notes "auto build"
