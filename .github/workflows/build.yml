@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          path: deploy-repo
+
       - name: Checkout SimpleHub
         uses: actions/checkout@v4
         with:
@@ -36,6 +41,7 @@ jobs:
 
       - name: Pack
         run: |
+          rm -rf release
           mkdir -p release/SimpleHub
           cp -r SimpleHub-src/server release/SimpleHub/
           mkdir -p release/SimpleHub/server/web
@@ -58,11 +64,10 @@ jobs:
           tar -C release -czf simplehub-prebuilt.tar.gz SimpleHub
 
       - name: Publish release
+        working-directory: deploy-repo
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=latest-build
-          gh release delete "$TAG" -y || true
-          git tag -d "$TAG" || true
-          git push origin ":refs/tags/$TAG" || true
-          gh release create "$TAG" simplehub-prebuilt.tar.gz --title "$TAG" --notes "auto build"
+          gh release delete latest-build -y || true
+          git push origin :refs/tags/latest-build || true
+          gh release create latest-build ../simplehub-prebuilt.tar.gz --title latest-build --notes "auto build"
