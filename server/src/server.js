@@ -62,7 +62,8 @@ async function buildServer() {
 
 async function startServer() {
   const app = await buildServer();
-  await app.listen({ port: CONFIG.PORT, host: '0.0.0.0' });
+  const listenHost = process.env.IP || process.env.HOST || '::';
+  await app.listen({ port: Number(process.env.PORT || CONFIG.PORT || 8100), host: listenHost });
   return app;
 }
 
