@@ -45,7 +45,6 @@ jobs:
           set -euo pipefail
           cd "$HOME/SimpleHub/server"
           export PORT="${PORT:-8100}"
-          export HOST="${HOST:-${IP:-::}}"
           export NODE_ENV="${NODE_ENV:-production}"
           export DATABASE_URL="${DATABASE_URL:-file:./data/db.sqlite}"
           exec npm start
