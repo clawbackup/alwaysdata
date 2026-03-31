@@ -19,7 +19,7 @@ jobs:
       - name: Checkout SimpleHub
         uses: actions/checkout@v4
         with:
-          repository: jwy87/SimpleHub
+          repository: clawbackup/SimpleHub
           path: SimpleHub-src
 
       - name: Setup Node 20
